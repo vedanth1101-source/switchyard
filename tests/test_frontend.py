@@ -5,9 +5,18 @@ from fastapi.testclient import TestClient
 
 import app.main
 from app.main import create_app
+from app.routes import health
 
 HTML = {"accept": "text/html"}
 SPA_MARKER = '<div id="root">switchyard-test-shell</div>'
+HEALTHY = {"status": "ok", "db": "ok", "redis": "ok"}
+
+
+def with_healthy_services(test_app):
+    # These tests cover frontend routing; DB/Redis behavior is covered in test_health.py.
+    test_app.dependency_overrides[health.database_status] = lambda: "ok"
+    test_app.dependency_overrides[health.redis_status] = lambda: "ok"
+    return test_app
 
 
 @pytest.fixture
@@ -21,7 +30,7 @@ def fake_dist(tmp_path):
 
 @pytest.fixture
 def client(fake_dist):
-    return TestClient(create_app(frontend_dir=fake_dist))
+    return TestClient(with_healthy_services(create_app(frontend_dir=fake_dist)))
 
 
 def test_default_frontend_dir_is_vite_build_output():
@@ -60,7 +69,7 @@ def test_api_health_is_not_swallowed_by_frontend(client):
     response = client.get("/api/health", headers=HTML)
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == HEALTHY
 
 
 def test_api_docs_and_openapi_are_not_swallowed_by_frontend(client):
@@ -126,4 +135,4 @@ def test_missing_frontend_build_is_tolerated_with_warning_in_development(monkeyp
     with pytest.warns(UserWarning, match="does not exist"):
         dev_app = create_app(frontend_dir=tmp_path / "not-built")
 
-    assert TestClient(dev_app).get("/api/health").json() == {"status": "ok"}
+    assert TestClient(with_healthy_services(dev_app)).get("/api/health").json() == HEALTHY
