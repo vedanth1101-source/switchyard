@@ -1,0 +1,18 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+.pytest_cache/
+.coverage
+
+# Frontend
+node_modules/
+web/dist/
+
+# Vercel
+.vercel/
