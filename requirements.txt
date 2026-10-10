@@ -3,3 +3,8 @@ certifi==2026.5.20
 fastapi==0.143.0
 starlette==1.7.0
 pydantic==2.14.0
+sqlmodel==0.0.48
+sqlalchemy==2.1.4
+psycopg[binary]==3.3.6
+redis==8.1.0
+pydantic-settings==2.15.0
