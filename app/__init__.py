@@ -1,0 +1,1 @@
+"""Switchyard app package."""
