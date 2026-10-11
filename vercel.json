@@ -4,7 +4,7 @@
   "functions": {
     "app/main.py": {
       "maxDuration": 60,
-      "excludeFiles": "{tests/**,docs/**,data/**,.venv/**,.claude/**,**/__pycache__/**,.pytest_cache/**,.ruff_cache/**,htmlcov/**,requirements-dev.txt,docker-compose.yml,web/src/**,web/node_modules/**,web/index.html,web/package.json,web/package-lock.json,web/tsconfig.json,web/vite.config.ts}"
+      "excludeFiles": "{tests/**,docs/**,data/**,**/__pycache__/**,requirements-dev.txt,docker-compose.yml,web/src/**,web/node_modules/**,web/index.html,web/package.json,web/package-lock.json,web/tsconfig.json,web/vite.config.ts}"
     }
   }
 }
