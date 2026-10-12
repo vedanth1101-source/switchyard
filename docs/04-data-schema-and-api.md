@@ -118,13 +118,16 @@ Response `200`
     "tier": "cheap",
     "reason": "EASY",
     "model_chain": ["cheap-code", "cheap-general"],
-    "jev_latency_ms": 142
+    "jev_latency_ms": 142,
+    "jev_error": null,
+    "jev_http_status": null,
+    "jev_error_cause": null
   },
   "response": {
     "model": "cheap-code",
     "text": "def is_prime(n): …",
     "latency_ms": 910,
-    "attempts": [{"model": "cheap-code", "attempt_no": 1, "status": "success", "latency_ms": 910}]
+    "attempts": [{"model": "cheap-code", "attempt_no": 1, "status": "success", "latency_ms": 910, "http_status": 200}]
   },
   "cost": {"est_cost_usd": 0.00004, "baseline_cost_usd": 0.0021, "saved_usd": 0.00206},
   "total_latency_ms": 1075
@@ -132,6 +135,38 @@ Response `200`
 ```
 Errors: `422` empty or > 8,000-character prompt · `429` rate limited (`Retry-After`
 header) · `502` all models failed or deadline hit (body has `attempts`).
+
+Diagnostic fields (implemented in `app/routes/route.py`; present in `200` bodies and, under
+`decision` / `attempts`, in `502`/`503` failure bodies). They carry status codes and exception
+class names only, never exception messages, response bodies, URLs, prompts or keys.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `decision.jev_error` | string \| null | Exception class of a failed Jev call (e.g. `JevTimeoutError`, `JevAuthError`); null when Jev succeeded |
+| `decision.jev_http_status` | int \| null | HTTP status Jev returned on failure (e.g. `401`); null when Jev succeeded or failed without a response (timeout, network) |
+| `decision.jev_error_cause` | string \| null | Underlying network exception class for a Jev timeout or network failure (`ReadTimeout`, `ConnectTimeout`, `ConnectError`, …; `TimeoutError` when the whole-call `JEV_TIMEOUT_SECONDS` limit fired); null otherwise |
+| `attempts[].http_status` | int \| null | Gateway HTTP status for every attempt, including the actual 2xx of a successful call; null for timeouts, network errors and `deadline` entries (no response) |
+| `attempts[].input_tokens` / `output_tokens` | int \| null | Gateway `usage.prompt_tokens` / `completion_tokens` for a successful call, and for a `malformed` 200 with empty visible text when its `usage` is valid; null for every other failure |
+| `attempts[].reasoning_tokens` | int \| null | Gateway `usage.completion_tokens_details.reasoning_tokens` for a successful call; null when absent or invalid (never `0` in that case) and for failed attempts |
+
+Cost estimate limitations (`cost`, implemented in `app/core/costs.py`). It is a list-price estimate
+for the successful call only, so it is a lower bound on what a request cost:
+
+- Jev credits are excluded (`includes_jev: false`).
+- Failed attempts contribute nothing to `cost`:
+  - Gateway error responses (4xx/5xx) carry an `error` object and no `usage`, so their tokens are
+    unknown (null). Whether the provider bills any of them is not documented.
+  - Timeouts and network errors have no response, so their tokens are unknown (null) even if the
+    provider finished (and billed) the generation.
+  - A `200` with empty visible text (`status: "malformed"`, e.g. reasoning used the whole
+    `max_tokens` budget) is billed. Its `input_tokens`/`output_tokens` are recorded on the attempt
+    when `usage` is valid, but they are not priced into `cost`. A `200` whose content is null rather
+    than an empty string is still rejected before `usage` is read, so its tokens stay null.
+- `output_tokens` is the gateway's `completion_tokens`. For reasoning models this appears to include
+  hidden reasoning tokens, which the gateway also reports as
+  `completion_tokens_details.reasoning_tokens` (exposed as `attempts[].reasoning_tokens`), so they
+  are priced as output, which matches how they are billed. Reasoning tokens are not priced
+  separately and are not reported for `malformed` attempts.
 
 ### Other endpoints
 | Method | Path | Returns |
