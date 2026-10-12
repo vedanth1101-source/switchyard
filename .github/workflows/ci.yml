@@ -92,22 +92,25 @@ jobs:
             requirements.txt
             requirements-dev.txt
       - run: python -m pip install -r requirements-dev.txt
-      - name: Integration test against real Postgres and Redis
+      - name: Integration tests against real Postgres and Redis
         env:
           DATABASE_URL: postgresql+psycopg://switchyard:switchyard-ci-only@localhost:5432/switchyard
           REDIS_URL: redis://localhost:6379/0
           FASTAPI_ENV: production
-        run: pytest -m integration -rA --junitxml="$RUNNER_TEMP/integration.xml" tests/test_health_integration.py
-      - name: Require the integration test to have run and passed (not skipped)
+        run: >-
+          pytest -m integration -rA --junitxml="$RUNNER_TEMP/integration.xml"
+          tests/test_health_integration.py tests/test_migrations_integration.py
+      - name: Require the integration tests to have run and passed (not skipped)
         run: |
           python - <<'EOF'
           import os, sys, xml.etree.ElementTree as ET
+          REQUIRED = {"test_health_reports_db_and_redis", "test_migrations_upgrade_downgrade_round_trip"}
           root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "integration.xml")).getroot()
           cases = list(root.iter("testcase"))
           bad = [c.get("name") for c in cases if c.find("skipped") is not None
                  or c.find("failure") is not None or c.find("error") is not None]
           passed = {c.get("name") for c in cases} - set(bad)
-          if not cases or bad or "test_health_reports_db_and_redis" not in passed:
+          if not cases or bad or not REQUIRED <= passed:
               sys.exit(f"integration check failed: ran={len(cases)} not_passed={bad} passed={sorted(passed)}")
           print(f"integration check ok: {sorted(passed)}")
           EOF
