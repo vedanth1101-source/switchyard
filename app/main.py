@@ -9,6 +9,7 @@ from os import PathLike
 from fastapi import FastAPI, HTTPException
 
 from app.routes import health
+from app.routes import route as route_api
 
 # Relative to the working directory: the project root locally and on Vercel.
 FRONTEND_DIR = "web/dist"
@@ -22,6 +23,7 @@ def create_app(frontend_dir: str | PathLike[str] = FRONTEND_DIR) -> FastAPI:
         redoc_url=None,
     )
     application.include_router(health.router, prefix="/api")
+    application.include_router(route_api.router, prefix="/api")
 
     # Unknown /api paths must be a JSON 404, not the frontend's index.html navigation fallback.
     # Keep this after every API router: Starlette uses the first full match, so API routes

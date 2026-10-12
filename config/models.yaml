@@ -1,7 +1,6 @@
 # Switchyard model configuration (Task 0.9).
 #
-# Nothing loads this file yet: the validating loader (app/core/model_config.py, PyYAML) is Task 1.1.
-# The loader is expected to build RoutingConfig from it:
+# Loaded and validated by app/core/model_config.py (Task S1.1), which builds RoutingConfig from it:
 #   RoutingConfig.models               <- routes
 #   RoutingConfig.general_strong_chain <- routes.general.strong   (derived; never set separately)
 # Routing thresholds stay in RoutingConfig/settings (TRD §8); the strong daily cap is the

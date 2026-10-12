@@ -7,6 +7,8 @@ client-side limits per technical requirements.
 
 from __future__ import annotations
 
+import asyncio
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -18,10 +20,13 @@ import httpx
 class JevClientError(Exception):
     """Base exception for JevStation client errors."""
 
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(self, message: str, status_code: Optional[int] = None, cause_type: Optional[str] = None):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        # Class name of the underlying httpx exception for network failures (e.g. "ReadTimeout");
+        # safe to log, unlike the message or the chained exception, which holds the request.
+        self.cause_type = cause_type
 
 
 class JevAuthError(JevClientError):
@@ -91,7 +96,7 @@ class JevClient:
     """
 
     DEFAULT_BASE_URL = "https://jevstation.com/api/v1/systemone"
-    DEFAULT_TIMEOUT_SECONDS = 3.0
+    DEFAULT_TIMEOUT_SECONDS = 8.0  # Settings.jev_timeout_seconds (JEV_TIMEOUT_SECONDS) defaults to this
     MAX_STATE_CHARS = 24000
 
     def __init__(
@@ -101,6 +106,13 @@ class JevClient:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         client: Optional[httpx.AsyncClient] = None,
     ):
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be a finite number of seconds > 0")
         resolved_key = api_key or load_api_key_from_env_or_file()
         if not resolved_key:
             raise JevAuthError("JEVSTATION_API_KEY is missing. Configure it in .env or environment.")
@@ -162,15 +174,21 @@ class JevClient:
         headers = self._get_headers()
 
         try:
-            response = await self._client.post(
-                self.base_url,
-                headers=headers,
-                json=payload,
-            )
-        except httpx.TimeoutException as exc:
-            raise JevTimeoutError(f"JevStation evaluation timed out after {self.timeout}s: {exc}") from exc
+            # httpx applies its timeout per phase (connect, write, read); this bounds the whole call.
+            async with asyncio.timeout(self.timeout):
+                response = await self._client.post(
+                    self.base_url,
+                    headers=headers,
+                    json=payload,
+                )
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            raise JevTimeoutError(
+                f"JevStation evaluation timed out after {self.timeout}s: {exc}", cause_type=type(exc).__name__
+            ) from exc
         except httpx.RequestError as exc:
-            raise JevClientError(f"Network error communicating with JevStation: {exc}") from exc
+            raise JevClientError(
+                f"Network error communicating with JevStation: {exc}", cause_type=type(exc).__name__
+            ) from exc
 
         return self._handle_response(response)
 
@@ -182,14 +200,15 @@ class JevClient:
         headers = self._get_headers()
 
         try:
-            response = await self._client.get(
-                self.base_url,
-                headers=headers,
-            )
-        except httpx.TimeoutException as exc:
-            raise JevTimeoutError(f"JevStation auth check timed out: {exc}") from exc
+            async with asyncio.timeout(self.timeout):
+                response = await self._client.get(
+                    self.base_url,
+                    headers=headers,
+                )
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            raise JevTimeoutError(f"JevStation auth check timed out: {exc}", cause_type=type(exc).__name__) from exc
         except httpx.RequestError as exc:
-            raise JevClientError(f"Network error during auth check: {exc}") from exc
+            raise JevClientError(f"Network error during auth check: {exc}", cause_type=type(exc).__name__) from exc
 
         return self._handle_response(response)
 

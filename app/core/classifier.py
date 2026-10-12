@@ -7,10 +7,13 @@ maps difficulty levels to the internal representation, and emits a typed JevDeci
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from app.core.jev_client import JevClientError
+
+DIFFICULTY_LEVELS = ("0", "1", "2", "3", "4")  # difficulty.probabilities keys: trivial .. expert
 
 
 class JevMalformedResponseError(JevClientError):
@@ -27,8 +30,8 @@ class JevDecision:
 
     task_type: str
     task_type_probs: Dict[str, float]
-    difficulty: float  # Normalized scale (default: 1–5 expected value per specification)
-    raw_difficulty: float  # Unmodified JevStation scale (0–4 expected value)
+    difficulty: float  # 1 + expected level of difficulty_dist (1–5 scale by default)
+    raw_difficulty: float  # Jev's difficulty.score as returned; diagnostics only, not used for routing
     difficulty_dist: Dict[str, float]
     needs_reasoning_prob: float
     confidence: float  # Minimum of task_type and difficulty confidences
@@ -78,8 +81,7 @@ def parse_jev_response(data: Dict[str, Any], difficulty_scale: str = "1-5") -> J
 
     Args:
         data: Raw response dict from JevStation POST /api/v1/systemone.
-        difficulty_scale: Either "1-5" (converts 0–4 to 1–5 scale per project TRD)
-                          or "0-4" (preserves raw score).
+        difficulty_scale: "1-5" (expected level + 1, per project TRD) or "0-4" (expected level).
 
     Returns:
         JevDecision: Structured, normalized evaluation metrics.
@@ -126,17 +128,14 @@ def parse_jev_response(data: Dict[str, Any], difficulty_scale: str = "1-5") -> J
     if not isinstance(diff_confidence, (int, float)) or not (0.0 <= diff_confidence <= 1.0):
         raise JevMalformedResponseError(f"Invalid confidence value in difficulty: {diff_confidence}")
 
-    diff_dist = difficulty_ans.get("probabilities", {})
-    if not isinstance(diff_dist, dict):
-        diff_dist = {}
-
-    # Map difficulty scale
+    # Difficulty is the expected level of the distribution (TRD §4), not Jev's `score`, whose
+    # semantics are undocumented. The score is kept only as raw_difficulty.
+    expected_level, diff_dist = _expected_difficulty_level(difficulty_ans.get("probabilities"))
     if difficulty_scale == "1-5":
-        # Per specification (docs/02-technical-requirements.md): Map Score levels to 1–5
-        # 0.0 -> 1.0 (trivial), up to 4.0 -> 5.0 (expert)
-        difficulty = raw_difficulty + 1.0
+        # Levels 0 (trivial) .. 4 (expert) map to 1 .. 5
+        difficulty = expected_level + 1.0
     else:
-        difficulty = raw_difficulty
+        difficulty = expected_level
 
     # 3. Validate needs_reasoning (Noul question)
     reasoning_ans = answers.get("needs_reasoning")
@@ -162,15 +161,52 @@ def parse_jev_response(data: Dict[str, Any], difficulty_scale: str = "1-5") -> J
 
     return JevDecision(
         task_type=choice,
-        task_type_probs={str(k): float(v) for k, v in task_probs.items()},
+        task_type_probs=_float_map(task_probs, "task_type.probabilities"),
         difficulty=difficulty,
         raw_difficulty=raw_difficulty,
-        difficulty_dist={str(k): float(v) for k, v in diff_dist.items()},
+        difficulty_dist=diff_dist,
         needs_reasoning_prob=needs_reasoning_prob,
         confidence=overall_confidence,
         jev_model=str(model_name) if model_name else None,
-        jev_latency_ms=int(latency_ms) if latency_ms is not None else None,
-        jev_input_tokens=int(input_tokens) if input_tokens is not None else None,
-        credits_charged=int(credits_charged) if credits_charged is not None else None,
-        credits_remaining=int(credits_remaining) if credits_remaining is not None else None,
+        jev_latency_ms=_optional_int(latency_ms, "latency_ms"),
+        jev_input_tokens=_optional_int(input_tokens, "usage.input_tokens"),
+        credits_charged=_optional_int(credits_charged, "credits.charged"),
+        credits_remaining=_optional_int(credits_remaining, "credits.remaining"),
     )
+
+
+# Conversion failures below are malformed Jev data, not programming errors. Messages name the field
+# only (never the value) and the conversion error is not chained.
+
+
+def _float_map(values: Dict[Any, Any], field: str) -> Dict[str, float]:
+    try:
+        return {str(k): float(v) for k, v in values.items()}
+    except (TypeError, ValueError):
+        raise JevMalformedResponseError(f"Non-numeric value in {field}") from None
+
+
+def _expected_difficulty_level(dist: Any) -> Tuple[float, Dict[str, float]]:
+    """Returns (Σ level × p / Σ p over levels 0–4, the distribution as floats)."""
+    field = "difficulty.probabilities"
+    if not isinstance(dist, dict):
+        raise JevMalformedResponseError(f"Missing or invalid {field}")
+    if set(dist) != set(DIFFICULTY_LEVELS):
+        raise JevMalformedResponseError(f"{field} must have exactly the keys 0-4")
+    for value in dist.values():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise JevMalformedResponseError(f"Invalid probability in {field}")
+    total = sum(dist.values())
+    if total <= 0:
+        raise JevMalformedResponseError(f"{field} must have a positive total")
+    expected = sum(int(level) * dist[level] for level in DIFFICULTY_LEVELS) / total
+    return float(expected), {level: float(dist[level]) for level in DIFFICULTY_LEVELS}
+
+
+def _optional_int(value: Any, field: str) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise JevMalformedResponseError(f"Non-integer value in {field}") from None

@@ -1,15 +1,19 @@
+import asyncio
 import json
 import os
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 
 from app.core import jev_client
 from app.core.jev_client import (
     JevAuthError,
     JevClient,
+    JevClientError,
     JevCreditError,
     JevRateLimitError,
     JevResponseError,
@@ -33,7 +37,7 @@ class TestJevClient(unittest.IsolatedAsyncioTestCase):
     async def test_client_initialization_with_explicit_key(self):
         client = JevClient(api_key="test_key_123")
         self.assertEqual(client.api_key, "test_key_123")
-        self.assertEqual(client.timeout, 3.0)
+        self.assertEqual(client.timeout, 8.0)
 
     async def test_missing_api_key_raises_auth_error(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -148,6 +152,112 @@ class TestJevClient(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError) as ctx:
             await client.evaluate(state=oversized_state, questions={})
         self.assertIn("exceeds maximum allowed length", str(ctx.exception))
+
+
+def raising_client(error: Exception) -> JevClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    return JevClient(api_key="test_key_123", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type"),
+    [
+        (httpx.ReadTimeout("read timed out"), JevTimeoutError),
+        (httpx.ConnectTimeout("connect timed out"), JevTimeoutError),
+        (httpx.ConnectError("certificate verify failed"), JevClientError),
+        (httpx.RemoteProtocolError("server disconnected"), JevClientError),
+    ],
+    ids=["ReadTimeout", "ConnectTimeout", "ConnectError", "RemoteProtocolError"],
+)
+@pytest.mark.parametrize("call", ["evaluate", "check_auth"])
+def test_network_errors_record_the_httpx_exception_class_name(error, expected_type, call):
+    client = raising_client(error)
+
+    async def run():
+        async with client:
+            if call == "evaluate":
+                await client.evaluate(state="test state", questions={})
+            else:
+                await client.check_auth()
+
+    with pytest.raises(expected_type) as excinfo:
+        asyncio.run(run())
+
+    assert excinfo.value.cause_type == type(error).__name__
+    assert excinfo.value.status_code is None
+
+
+def test_default_timeout_is_8_seconds_and_reaches_the_http_client():
+    client = JevClient(api_key="test_key_123")
+
+    assert JevClient.DEFAULT_TIMEOUT_SECONDS == 8.0
+    assert client.timeout == 8.0
+    assert client._client.timeout.read == 8.0
+    assert client._client.timeout.connect == 8.0
+
+
+def test_custom_timeout_reaches_the_http_client():
+    client = JevClient(api_key="test_key_123", timeout=5.5)
+
+    assert client.timeout == 5.5
+    assert client._client.timeout.read == 5.5
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 0.0, float("nan"), float("inf"), True, "8"])
+def test_invalid_timeout_is_rejected_before_any_request(timeout):
+    with pytest.raises(ValueError, match="timeout"):
+        JevClient(api_key="test_key_123", timeout=timeout)
+
+
+@pytest.mark.parametrize("call", ["evaluate", "check_auth"])
+def test_timeout_bounds_the_whole_call_not_each_phase(call):
+    # A server that accepts the request but never finishes the response: the whole call must end
+    # at the configured timeout, even though the HTTP client's own per-phase limit is much longer.
+    requests = []
+
+    async def stalled(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        await asyncio.sleep(5)
+        return httpx.Response(200, json={"code": 0})
+
+    async def run():
+        transport = httpx.MockTransport(stalled)
+        http = httpx.AsyncClient(transport=transport, timeout=30.0)
+        async with JevClient(api_key="test_key_123", timeout=0.05, client=http) as client:
+            if call == "evaluate":
+                await client.evaluate(state="test state", questions={})
+            else:
+                await client.check_auth()
+
+    started = time.monotonic()
+    with pytest.raises(JevTimeoutError) as excinfo:
+        asyncio.run(run())
+    elapsed = time.monotonic() - started
+
+    assert len(requests) == 1  # never retried
+    assert elapsed < 1.0
+    assert excinfo.value.cause_type == "TimeoutError"
+    assert excinfo.value.status_code is None
+    assert "test_key_123" not in str(excinfo.value)
+
+
+def test_http_errors_have_no_cause_type():
+    async def run():
+        transport = httpx.MockTransport(lambda request: httpx.Response(401))
+        async with JevClient(api_key="test_key_123", client=httpx.AsyncClient(transport=transport)) as client:
+            await client.evaluate(state="test state", questions={})
+
+    with pytest.raises(JevAuthError) as excinfo:
+        asyncio.run(run())
+
+    assert excinfo.value.cause_type is None
+
+
+def test_cause_type_defaults_to_none():
+    assert JevClientError("x").cause_type is None
+    assert JevTimeoutError("x").cause_type is None
 
 
 def isolate_key_sources(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:

@@ -1,0 +1,107 @@
+{
+  "_comment": "Real Vercel AI Gateway chat completion (openai/gpt-5-nano), captured 2026-10-12 by one approved live CLI run. Sanitized: every string except object/model/role/finish_reason replaced with <redacted>; timestamps zeroed; numbers kept.",
+  "id": "<redacted>",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "openai/gpt-5-nano",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "<redacted>",
+        "reasoning_details": [
+          {
+            "type": "<redacted>",
+            "data": "<redacted>",
+            "id": "<redacted>",
+            "format": "<redacted>",
+            "index": 0
+          }
+        ],
+        "provider_metadata": {
+          "openai": {
+            "responseId": "<redacted>",
+            "serviceTier": "<redacted>",
+            "reasoningContext": "<redacted>"
+          },
+          "gateway": {
+            "routing": {
+              "originalModelId": "<redacted>",
+              "resolvedProvider": "<redacted>",
+              "fallbacksAvailable": [
+                "<redacted>"
+              ],
+              "planningReasoning": "<redacted>",
+              "canonicalSlug": "<redacted>",
+              "finalProvider": "<redacted>",
+              "modelAttemptCount": 1,
+              "modelAttempts": [
+                {
+                  "canonicalSlug": "<redacted>",
+                  "success": true,
+                  "providerAttemptCount": 1,
+                  "providerAttempts": [
+                    {
+                      "provider": "<redacted>",
+                      "credentialType": "<redacted>",
+                      "success": true,
+                      "startTime": 0,
+                      "endTime": 0,
+                      "providerRequestId": "<redacted>",
+                      "statusCode": 200,
+                      "providerResponseId": "<redacted>"
+                    }
+                  ]
+                }
+              ],
+              "totalProviderAttemptCount": 1,
+              "affinity": {
+                "outcome": "<redacted>"
+              },
+              "clientSessionId": "<redacted>",
+              "clientSessionIdSource": "<redacted>"
+            },
+            "cost": "<redacted>",
+            "marketCost": "<redacted>",
+            "surchargeCost": "<redacted>",
+            "gatewayCost": "<redacted>",
+            "inferenceCost": "<redacted>",
+            "inputInferenceCost": "<redacted>",
+            "outputInferenceCost": "<redacted>",
+            "generationId": "<redacted>"
+          }
+        }
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 13,
+    "completion_tokens": 115,
+    "total_tokens": 128,
+    "cost": 4.665e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": null,
+      "upstream_inference_prompt_cost": 0,
+      "upstream_inference_completions_cost": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 64,
+      "image_tokens": 0
+    },
+    "cache_creation_input_tokens": 0,
+    "market_cost": 4.665e-05,
+    "gateway_cost": 4.665e-05
+  },
+  "system_fingerprint": "<redacted>",
+  "service_tier": "<redacted>",
+  "generationId": "<redacted>"
+}
