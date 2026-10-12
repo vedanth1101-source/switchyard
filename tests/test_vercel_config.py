@@ -59,6 +59,13 @@ def test_function_config_targets_fastapi_entrypoint():
     assert functions["app/main.py"]["maxDuration"] == 60
 
 
+def test_exclude_files_fits_vercel_length_limit():
+    # The Vercel API rejects the deployment (400) when excludeFiles is longer than 256 characters.
+    exclude = load_vercel_config()["functions"]["app/main.py"]["excludeFiles"]
+
+    assert len(exclude) <= 256, len(exclude)
+
+
 def test_exclude_files_keep_runtime_code_and_frontend_build():
     exclude = load_vercel_config()["functions"]["app/main.py"]["excludeFiles"]
     patterns = expand_braces(exclude)
