@@ -9,6 +9,7 @@ from app.core.classifier import (
     get_default_questions,
     parse_jev_response,
 )
+from app.core.policy import RoutingConfig, decide_route
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -36,6 +37,46 @@ def test_parse_live_fixture_successfully():
     assert decision.jev_input_tokens == 446
     assert decision.credits_charged == 1
     assert decision.credits_remaining == 199
+
+
+def test_parse_synthetic_low_confidence_fixture():
+    # Synthetic fixture (Task 0.8): same schema as the live one, values hand-written.
+    payload = load_fixture("jev_response_low_confidence.synthetic.json")
+    decision = parse_jev_response(payload)
+
+    assert decision.task_type == "math"
+    assert decision.task_type_probs["math"] == 0.55
+    # min(0.55, 0.45) = 0.45
+    assert decision.confidence == 0.45
+    # 0-4 expected value 3.2 -> 4.2 on the 1-5 scale
+    assert round(decision.raw_difficulty, 2) == 3.2
+    assert round(decision.difficulty, 2) == 4.2
+    assert decision.needs_reasoning_prob == 0.82
+    assert decision.jev_model is None
+    assert decision.jev_latency_ms is None
+    assert decision.jev_input_tokens is None
+    assert decision.credits_charged is None
+    assert decision.credits_remaining is None
+
+
+def test_synthetic_fixture_routes_low_confidence():
+    payload = load_fixture("jev_response_low_confidence.synthetic.json")
+    config = RoutingConfig(
+        models={
+            "math": {"cheap": ["math-cheap"], "strong": ["math-strong"]},
+            "general": {"cheap": ["general-cheap"], "strong": ["general-strong"]},
+        },
+        general_strong_chain=["general-strong"],
+    )
+
+    route = decide_route(parse_jev_response(payload), config)
+
+    # Low confidence wins over HARD (difficulty 4.2, reasoning 0.82): strong general chain.
+    assert route.tier == "strong"
+    assert route.task_type == "general"
+    assert route.reason == "LOW_CONFIDENCE"
+    assert route.model_chain == ["general-strong"]
+    assert route.confidence == 0.45
 
 
 def test_raw_0_to_4_scale_option():
