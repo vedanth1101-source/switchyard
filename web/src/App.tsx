@@ -1,8 +1,23 @@
 import { useEffect, useState } from "react";
 
-type HealthState = { kind: "loading" } | { kind: "ok" } | { kind: "error"; message: string };
+type ComponentStatus = "ok" | "error" | "not_configured";
+type HealthReport = { status: "ok" | "degraded"; db: ComponentStatus; redis: ComponentStatus };
+type HealthState = { kind: "loading" } | { kind: "report"; report: HealthReport } | { kind: "error"; message: string };
 
-// Task 0.3 shows API status only; DB and Redis indicators arrive with Task 0.5.
+const COMPONENT_STATUSES: readonly unknown[] = ["ok", "error", "not_configured"];
+
+function isHealthReport(body: unknown): body is HealthReport {
+  if (typeof body !== "object" || body === null) return false;
+  const { status, db, redis } = body as Record<string, unknown>;
+  return (status === "ok" || status === "degraded") && COMPONENT_STATUSES.includes(db) && COMPONENT_STATUSES.includes(redis);
+}
+
+function describe(name: string, status: ComponentStatus): string {
+  const label = status === "ok" ? "ok" : status === "not_configured" ? "not configured" : "unavailable";
+  return `${name} ${label}`;
+}
+
+// The API answers 200 when DB and Redis are healthy and 503 with the same report when degraded.
 export default function App() {
   const [health, setHealth] = useState<HealthState>({ kind: "loading" });
 
@@ -12,16 +27,19 @@ export default function App() {
     async function loadHealth() {
       try {
         const response = await fetch("/api/health", { signal: controller.signal });
-        if (!response.ok) {
+        if (!response.ok && response.status !== 503) {
           setHealth({ kind: "error", message: `API unavailable (HTTP ${response.status})` });
           return;
         }
-        const body: { status?: unknown } = await response.json();
-        setHealth(
-          body.status === "ok"
-            ? { kind: "ok" }
-            : { kind: "error", message: "API returned an unexpected health status" },
-        );
+        // A 503 may come from the platform rather than the API, with a non-JSON body (e.g. HTML).
+        const body: unknown = response.ok ? await response.json() : await response.json().catch(() => undefined);
+        if (isHealthReport(body)) {
+          setHealth({ kind: "report", report: body });
+        } else if (response.ok) {
+          setHealth({ kind: "error", message: "API returned an unexpected health status" });
+        } else {
+          setHealth({ kind: "error", message: `API unavailable (HTTP ${response.status})` });
+        }
       } catch (error: unknown) {
         if (controller.signal.aborted) return;
         const detail = error instanceof Error ? error.message : "unknown error";
@@ -34,7 +52,11 @@ export default function App() {
   }, []);
 
   const statusText =
-    health.kind === "loading" ? "Checking API…" : health.kind === "ok" ? "API ok" : health.message;
+    health.kind === "loading"
+      ? "Checking API…"
+      : health.kind === "report"
+        ? `API ok · ${describe("DB", health.report.db)} · ${describe("Redis", health.report.redis)}`
+        : health.message;
 
   return (
     <main>
