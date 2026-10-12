@@ -1,0 +1,5 @@
+httpx==0.28.1
+certifi==2026.5.20
+fastapi==0.143.0
+starlette==1.7.0
+pydantic==2.14.0

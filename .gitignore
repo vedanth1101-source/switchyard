@@ -9,6 +9,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cov_report/
+.ruff_cache/
+*.egg-info/
 
 # Frontend
 node_modules/
@@ -16,3 +22,6 @@ web/dist/
 
 # Vercel
 .vercel/
+
+# Claude Code task notes
+.claude/scratch.md
