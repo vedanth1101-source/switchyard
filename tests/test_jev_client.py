@@ -1,13 +1,17 @@
 import asyncio
+import gc
 import json
-import os
+import logging
 import time
+import traceback
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from app.core import jev_client
 from app.core.jev_client import (
@@ -18,7 +22,6 @@ from app.core.jev_client import (
     JevRateLimitError,
     JevResponseError,
     JevTimeoutError,
-    load_api_key_from_env_or_file,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -36,15 +39,13 @@ class TestJevClient(unittest.IsolatedAsyncioTestCase):
 
     async def test_client_initialization_with_explicit_key(self):
         client = JevClient(api_key="test_key_123")
-        self.assertEqual(client.api_key, "test_key_123")
+        self.assertEqual(client._api_key.get_secret_value(), "test_key_123")  # Held privately as a SecretStr
         self.assertEqual(client.timeout, 8.0)
 
     async def test_missing_api_key_raises_auth_error(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("app.core.jev_client.load_api_key_from_env_or_file", return_value=None):
-                with self.assertRaises(JevAuthError) as ctx:
-                    JevClient(api_key=None)
-                self.assertIn("JEVSTATION_API_KEY is missing", str(ctx.exception))
+        with self.assertRaises(JevAuthError) as ctx:
+            JevClient(api_key=None)
+        self.assertIn("JEVSTATION_API_KEY is missing", str(ctx.exception))
 
     async def test_successful_evaluate_returns_data(self):
         client = JevClient(api_key="test_key_123")
@@ -131,7 +132,9 @@ class TestJevClient(unittest.IsolatedAsyncioTestCase):
             mock_http.post = AsyncMock(return_value=mock_response)
             with self.assertRaises(JevResponseError) as ctx:
                 await client.evaluate(state="test state", questions={})
-            self.assertIn("internal error", str(ctx.exception))
+            # S2.7: the code is kept; Jev's message is not (it can echo input)
+            self.assertIn("-1", str(ctx.exception))
+            self.assertNotIn("internal error", str(ctx.exception))
 
     async def test_check_auth_get_request(self):
         client = JevClient(api_key="test_key_123")
@@ -260,62 +263,315 @@ def test_cause_type_defaults_to_none():
     assert JevTimeoutError("x").cause_type is None
 
 
-def isolate_key_sources(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
-    """Point both .env search paths at temp dirs so the real repo .env is never read."""
-    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)
-    cwd_dir = tmp_path / "cwd"
-    root_dir = tmp_path / "root"
-    cwd_dir.mkdir()
-    (root_dir / "app" / "core").mkdir(parents=True)
-    monkeypatch.chdir(cwd_dir)
-    monkeypatch.setattr(jev_client, "__file__", str(root_dir / "app" / "core" / "jev_client.py"))
-    return cwd_dir / ".env", root_dir / ".env"
+# --- S2.7: key from Settings only; sanitized errors -----------------------------------------
+
+CANARY_KEY = "jev-canary-key-S27-abcdef0123456789"
+CANARY_URL = "https://canary-user:canary-pass@canary.example.test/secret-path"
+CANARY_BODY = "CANARY-UPSTREAM-BODY-S27"
+CANARIES = (CANARY_KEY, CANARY_URL, "canary-pass", "canary.example.test", CANARY_BODY)
 
 
-def test_load_api_key_prefers_environment_variable(monkeypatch, tmp_path):
-    cwd_env, _ = isolate_key_sources(monkeypatch, tmp_path)
-    cwd_env.write_text("JEVSTATION_API_KEY=key-from-file\n", encoding="utf-8")
-    monkeypatch.setenv("JEVSTATION_API_KEY", "  key-from-env  ")
-
-    assert load_api_key_from_env_or_file() == "key-from-env"
+def transport_client(handler, key=CANARY_KEY, **kwargs) -> JevClient:
+    return JevClient(api_key=key, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), **kwargs)
 
 
-def test_load_api_key_reads_quoted_value_from_cwd_env_file(monkeypatch, tmp_path):
-    cwd_env, _ = isolate_key_sources(monkeypatch, tmp_path)
-    cwd_env.write_text('OTHER_VAR=x\nJEVSTATION_API_KEY="key-from-cwd"\n', encoding="utf-8")
+def run_call(client: JevClient, call: str):
+    async def run():
+        async with client:
+            if call == "evaluate":
+                return await client.evaluate(state="test state", questions={})
+            return await client.check_auth()
 
-    assert load_api_key_from_env_or_file() == "key-from-cwd"
-
-
-def test_load_api_key_skips_undecodable_cwd_file_and_uses_repo_root(monkeypatch, tmp_path):
-    cwd_env, root_env = isolate_key_sources(monkeypatch, tmp_path)
-    cwd_env.write_bytes(b"\xff\xfe\xfa invalid utf-8")
-    root_env.write_text("JEVSTATION_API_KEY=key-from-root\n", encoding="utf-8")
-
-    assert load_api_key_from_env_or_file() == "key-from-root"
+    return asyncio.run(run())
 
 
-def test_load_api_key_returns_none_when_key_missing_or_empty(monkeypatch, tmp_path):
-    cwd_env, _ = isolate_key_sources(monkeypatch, tmp_path)
-    cwd_env.write_text("OTHER_VAR=x\nJEVSTATION_API_KEY=\n", encoding="utf-8")
+def assert_sanitized(error: BaseException) -> None:
+    rendered = "".join(traceback.format_exception(error))
+    for canary in CANARIES:
+        assert canary not in str(error)
+        assert canary not in repr(error)
+        assert canary not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is None  # The upstream exception (holding the request) is not kept at all
+    assert error.__suppress_context__ is True
+    for frame, _ in traceback.walk_tb(error.__traceback__):
+        if frame.f_code.co_filename == jev_client.__file__:  # The client's own frames, not this test's
+            for value in frame.f_locals.values():
+                assert CANARY_KEY not in repr(value)  # e.g. no headers dict left in a frame
 
-    assert load_api_key_from_env_or_file() is None
+
+def assert_body_absent(error: BaseException) -> None:
+    rendered = "".join(traceback.format_exception(error))
+    for canary in CANARIES:
+        assert canary not in str(error)
+        assert canary not in rendered
 
 
-def test_default_env_search_paths_are_cwd_then_repo_root(monkeypatch, tmp_path):
-    # Repo root derived from this test file's location (tests/ -> repo root), independent of jev_client.
-    repo_root = Path(__file__).resolve().parents[1]
-    assert (repo_root / "pyproject.toml").is_file()
-    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)
+def test_missing_key_raises_auth_error_without_reading_the_environment_or_a_dotenv_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("JEVSTATION_API_KEY", CANARY_KEY)  # Ignored: the key comes only through Settings
+    (tmp_path / ".env").write_text(f"JEVSTATION_API_KEY={CANARY_KEY}\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    expected_cwd_env = Path.cwd() / ".env"
-    checked: list[Path] = []
+    opened = []
+    real_open = open
 
-    def record_without_opening(self: Path) -> bool:
-        checked.append(self)
-        return False  # report "no file" so no .env, including the real one, is ever opened
+    def recording_open(file, *args, **kwargs):
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "is_file", record_without_opening)
+    monkeypatch.setattr("builtins.open", recording_open)
 
-    assert load_api_key_from_env_or_file() is None
-    assert checked == [expected_cwd_env, repo_root / ".env"]
+    for missing in (None, "", "   ", SecretStr("  ")):
+        with pytest.raises(JevAuthError) as excinfo:
+            JevClient(api_key=missing)
+        assert "JEVSTATION_API_KEY" in str(excinfo.value)
+        assert CANARY_KEY not in str(excinfo.value)
+
+    assert not any(path.endswith(".env") for path in opened)
+    assert not hasattr(jev_client, "load_api_key_from_env_or_file")
+
+
+@pytest.mark.parametrize("key", [CANARY_KEY, SecretStr(CANARY_KEY)], ids=["str", "SecretStr"])
+@pytest.mark.parametrize("call", ["evaluate", "check_auth"])
+def test_both_key_types_send_the_bearer_header(key, call):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"code": 0, "data": {}})
+
+    run_call(transport_client(handler, key=key), call)
+
+    assert seen == [f"Bearer {CANARY_KEY}"]
+
+
+@pytest.mark.parametrize("key", [CANARY_KEY, SecretStr(CANARY_KEY)], ids=["str", "SecretStr"])
+def test_key_is_not_exposed_through_repr_or_attributes(key):
+    client = JevClient(api_key=key)
+
+    assert CANARY_KEY not in repr(client)
+    assert CANARY_KEY not in repr(vars(client))
+    assert all(CANARY_KEY not in str(value) for value in vars(client).values())
+    assert not hasattr(client, "api_key")
+    asyncio.run(client.aclose())
+
+
+NETWORK_FAILURES = [
+    (httpx.ReadTimeout(f"read timed out {CANARY_URL} {CANARY_KEY}"), JevTimeoutError, "ReadTimeout"),
+    (httpx.ConnectTimeout(f"connect timed out {CANARY_URL}"), JevTimeoutError, "ConnectTimeout"),
+    (
+        httpx.ConnectError(f"cannot reach {CANARY_URL} Authorization: Bearer {CANARY_KEY}"),
+        JevClientError,
+        "ConnectError",
+    ),
+    (httpx.RemoteProtocolError(f"{CANARY_BODY} {CANARY_URL}"), JevClientError, "RemoteProtocolError"),
+]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type", "cause_type"), NETWORK_FAILURES, ids=lambda v: getattr(v, "__name__", None)
+)
+@pytest.mark.parametrize("call", ["evaluate", "check_auth"])
+def test_network_failures_are_sanitized_and_keep_their_classification(error, expected_type, cause_type, call):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    with pytest.raises(JevClientError) as excinfo:
+        run_call(transport_client(handler), call)
+
+    assert type(excinfo.value) is expected_type
+    assert (excinfo.value.cause_type, excinfo.value.status_code) == (cause_type, None)
+    assert_sanitized(excinfo.value)
+
+
+@pytest.mark.parametrize("call", ["evaluate", "check_auth"])
+def test_whole_call_timeout_is_sanitized(call):
+    async def stalled(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(200, json={"code": 0})
+
+    with pytest.raises(JevTimeoutError) as excinfo:
+        run_call(transport_client(stalled, timeout=0.05), call)
+
+    assert excinfo.value.cause_type == "TimeoutError"
+    assert_sanitized(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_type", "retry_after"),
+    [
+        (400, JevClientError, None),
+        (401, JevAuthError, None),
+        (402, JevCreditError, None),
+        (403, JevClientError, None),
+        (404, JevClientError, None),
+        (429, JevRateLimitError, 45),
+        (500, JevResponseError, None),
+        (502, JevResponseError, None),
+    ],
+)
+def test_http_error_bodies_never_reach_the_error_and_status_is_kept(status, expected_type, retry_after):
+    body = json.dumps({"code": -1, "message": f"{CANARY_BODY} {CANARY_KEY} {CANARY_URL}"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text=body, headers={"Retry-After": "45"})
+
+    with pytest.raises(JevClientError) as excinfo:
+        run_call(transport_client(handler), "evaluate")
+
+    error = excinfo.value
+    assert type(error) is expected_type
+    assert (error.status_code, error.cause_type) == (status, None)
+    assert getattr(error, "retry_after", None) == retry_after
+    if expected_type in (JevClientError, JevResponseError):  # Generic branches name the status
+        assert str(status) in str(error)
+    assert_body_absent(error)
+
+
+def test_non_zero_envelope_code_is_kept_but_its_message_is_not():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 4321, "message": f"{CANARY_BODY} {CANARY_KEY}"})
+
+    with pytest.raises(JevResponseError) as excinfo:
+        run_call(transport_client(handler), "evaluate")
+
+    assert "4321" in str(excinfo.value)
+    assert excinfo.value.status_code == 200
+    assert_body_absent(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "body", [f"not json {CANARY_BODY}", '{"code": 0, "data": "' + CANARY_BODY], ids=["text", "truncated"]
+)
+def test_json_parse_failure_is_sanitized(body):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body)
+
+    with pytest.raises(JevResponseError) as excinfo:
+        run_call(transport_client(handler), "evaluate")
+
+    assert excinfo.value.status_code == 200
+    assert_sanitized(excinfo.value)
+
+
+def test_failures_log_nothing_sensitive(caplog):
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"cannot reach {CANARY_URL} {CANARY_KEY}")
+
+    def bad_request(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text=CANARY_BODY)
+
+    with caplog.at_level(logging.DEBUG):
+        for handler in (unreachable, bad_request):
+            with pytest.raises(JevClientError):
+                run_call(transport_client(handler), "evaluate")
+
+    for canary in CANARIES:
+        assert canary not in caplog.text
+
+
+# --- S2.7 review: what a frame-local capture of a Jev error can reach -----------------------
+
+SKIPPED_REFERENTS = (type, types.ModuleType, types.FunctionType, types.CodeType, types.FrameType, types.MethodType)
+
+
+def reachable_leaks(roots, depth: int = 10) -> set[str]:
+    """Bounded walk of everything reachable from `roots` (gc referents, not just repr): canaries found in
+    strings or bytes, and any httpx Request/Response. Types, modules, functions, code and frames are not
+    followed (they lead to whole modules), so this covers data structures, not arbitrary globals."""
+    found, seen, frontier = set(), set(), list(roots)
+    for _ in range(depth):
+        next_frontier = []
+        for obj in frontier:
+            if id(obj) in seen or isinstance(obj, SKIPPED_REFERENTS):
+                continue
+            seen.add(id(obj))
+            if isinstance(obj, (httpx.Request, httpx.Response)):
+                found.add(type(obj).__name__)
+            if isinstance(obj, (str, bytes, bytearray)):
+                text = obj if isinstance(obj, str) else bytes(obj).decode("utf-8", "replace")
+                found.update(canary for canary in (CANARY_KEY, CANARY_BODY) if canary in text)
+                continue
+            next_frontier.extend(gc.get_referents(obj))
+        frontier = next_frontier
+    return found
+
+
+def client_frame_locals(error: BaseException) -> list:
+    """Locals of the client's own frames on the error's traceback, except `self` (the client must hold
+    its key; see test_key_is_not_exposed_through_repr_or_attributes for what `self` exposes)."""
+    values = []
+    for frame, _ in traceback.walk_tb(error.__traceback__):
+        if frame.f_code.co_filename == jev_client.__file__:
+            values.extend(value for name, value in frame.f_locals.items() if name != "self")
+    return values
+
+
+def test_reachable_leaks_detects_a_response_and_both_canaries():
+    # The scanner itself must find what the tests below assert is absent.
+    request = httpx.Request("POST", "https://jev.example.test", headers={"Authorization": f"Bearer {CANARY_KEY}"})
+    response = httpx.Response(400, text=CANARY_BODY, request=request)
+
+    assert reachable_leaks([{"kept": response}]) == {"Response", "Request", CANARY_KEY, CANARY_BODY}
+
+
+RESPONSE_FAILURES = [
+    (httpx.Response(400, text=CANARY_BODY), JevClientError, 400),
+    (httpx.Response(401, text=CANARY_BODY), JevAuthError, 401),
+    (httpx.Response(402, text=CANARY_BODY), JevCreditError, 402),
+    (httpx.Response(429, text=CANARY_BODY, headers={"Retry-After": "45"}), JevRateLimitError, 429),
+    (httpx.Response(503, text=CANARY_BODY), JevResponseError, 503),
+    (httpx.Response(200, json={"code": 7, "message": CANARY_BODY}), JevResponseError, 200),
+    (httpx.Response(200, text=f"not json {CANARY_BODY}"), JevResponseError, 200),
+    (httpx.Response(200, json=[CANARY_BODY]), JevResponseError, 200),
+]
+
+
+@pytest.mark.parametrize(
+    ("template", "expected_type", "status"),
+    RESPONSE_FAILURES,
+    ids=["400", "401", "402", "429", "503", "envelope-code", "not-json", "not-an-object"],
+)
+@pytest.mark.parametrize("call", ["evaluate", "check_auth"])
+def test_response_errors_leave_no_response_request_key_or_body_in_client_frames(template, expected_type, status, call):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(template.status_code, headers=template.headers, content=template.content)
+
+    with pytest.raises(JevClientError) as excinfo:
+        run_call(transport_client(handler), call)
+
+    error = excinfo.value
+    assert (type(error), error.status_code, error.cause_type) == (expected_type, status, None)
+    assert getattr(error, "retry_after", None) == (45 if status == 429 else None)
+    assert error.__cause__ is None and error.__context__ is None
+    assert reachable_leaks(client_frame_locals(error)) == set()
+    assert reachable_leaks([error, vars(error)]) == set()  # Nor through the exception's own attributes
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type", "cause_type"), NETWORK_FAILURES, ids=lambda v: getattr(v, "__name__", None)
+)
+@pytest.mark.parametrize("call", ["evaluate", "check_auth"])
+def test_network_errors_leave_no_request_or_key_in_client_frames(error, expected_type, cause_type, call):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    with pytest.raises(JevClientError) as excinfo:
+        run_call(transport_client(handler), call)
+
+    assert reachable_leaks(client_frame_locals(excinfo.value)) == set()
+    assert reachable_leaks([excinfo.value, vars(excinfo.value)]) == set()
+
+
+def test_after_a_failed_call_the_client_holds_only_its_key():
+    # `self` is on every traceback, so this is what a frame capture of `self` can reach: the SecretStr
+    # key (by design) and nothing from the failed exchange.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text=CANARY_BODY)
+
+    client = transport_client(handler)
+    with pytest.raises(JevClientError):
+        run_call(client, "evaluate")
+
+    others = [value for name, value in vars(client).items() if name != "_api_key"]
+    assert reachable_leaks(others) == set()
+    assert reachable_leaks([client._api_key]) == {CANARY_KEY}  # The one place the key lives

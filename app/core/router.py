@@ -268,7 +268,9 @@ async def build_cli_deps(settings: Settings, *, dry_run: bool) -> AsyncIterator[
     """
     config = load_model_config(settings.models_config_path, confidence_threshold=settings.confidence_threshold)
     async with AsyncExitStack() as stack:
-        jev = await stack.enter_async_context(JevClient(timeout=settings.jev_timeout_seconds))
+        jev = await stack.enter_async_context(
+            JevClient(api_key=settings.jevstation_api_key, timeout=settings.jev_timeout_seconds)
+        )
         llm = None if dry_run else await stack.enter_async_context(_gateway_client(config, settings))
         budget = create_strong_budget(settings)
         if isinstance(budget, RedisStrongBudget):

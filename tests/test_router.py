@@ -441,7 +441,7 @@ def test_cli_failed_route_exits_1(capsys):
 
 
 def test_build_cli_deps_constructs_real_clients_without_network(monkeypatch):
-    monkeypatch.setenv("JEVSTATION_API_KEY", FAKE_KEY)  # env wins, so the real .env is never read
+    monkeypatch.setenv("JEVSTATION_API_KEY", FAKE_KEY)  # Reaches the client through Settings
     settings = Settings(ai_gateway_api_key=FAKE_KEY, redis_url=None, request_budget_seconds=40, jev_timeout_seconds=6.5)
 
     async def build(dry_run):
@@ -477,13 +477,39 @@ def test_cli_missing_gateway_key_exits_2_without_calling_anything(monkeypatch, c
 
 
 def test_cli_missing_jev_key_exits_2(monkeypatch, capsys):
-    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)
-    monkeypatch.setattr("app.core.jev_client.load_api_key_from_env_or_file", lambda: None)  # never read .env
+    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)  # The client never falls back to a .env file
 
     exit_code = main([PROMPT, "--dry-run"])
 
     assert exit_code == 2
     assert "JEVSTATION_API_KEY" in capsys.readouterr().err
+
+
+def test_build_cli_deps_passes_the_jev_key_from_settings(monkeypatch):
+    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)  # Only the Settings value can reach the client
+    settings = Settings(jevstation_api_key=FAKE_KEY, ai_gateway_api_key=FAKE_KEY, redis_url=None)
+
+    async def build():
+        async with build_cli_deps(settings, dry_run=True) as deps:
+            return deps.jev
+
+    jev = asyncio.run(build())
+
+    assert jev._api_key.get_secret_value() == FAKE_KEY
+
+
+def test_build_cli_deps_without_a_jev_key_in_settings_raises_auth_error(monkeypatch):
+    monkeypatch.setenv("JEVSTATION_API_KEY", FAKE_KEY)  # Read by Settings(); this instance overrides it
+    settings = Settings(jevstation_api_key=None, ai_gateway_api_key=FAKE_KEY, redis_url=None)
+
+    async def build():
+        async with build_cli_deps(settings, dry_run=True):
+            pass
+
+    with pytest.raises(JevAuthError) as excinfo:
+        asyncio.run(build())
+
+    assert FAKE_KEY not in str(excinfo.value)
 
 
 def test_gateway_key_env_matches_the_settings_field():

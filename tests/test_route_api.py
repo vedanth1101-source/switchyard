@@ -357,7 +357,7 @@ def test_routing_config_error_is_a_500_without_details():
 
 
 def test_real_dependencies_without_gateway_key_return_503_before_any_call(monkeypatch):
-    monkeypatch.setenv("JEVSTATION_API_KEY", FAKE_KEY)  # env wins, so the real .env is never read
+    monkeypatch.setenv("JEVSTATION_API_KEY", FAKE_KEY)  # Reaches the client through Settings
     monkeypatch.delenv("AI_GATEWAY_API_KEY", raising=False)
 
     response = TestClient(create_app()).post("/api/route", json={"prompt": PROMPT})
@@ -368,8 +368,7 @@ def test_real_dependencies_without_gateway_key_return_503_before_any_call(monkey
 
 
 def test_real_dependencies_without_jev_key_return_503(monkeypatch):
-    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)
-    monkeypatch.setattr("app.core.jev_client.load_api_key_from_env_or_file", lambda: None)  # never read .env
+    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)  # The client never falls back to a .env file
 
     response = TestClient(create_app()).post("/api/route", json={"prompt": PROMPT, "dry_run": True})
 

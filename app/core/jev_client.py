@@ -3,18 +3,27 @@ Asynchronous HTTP client for JevStation's System One API.
 
 Handles authentication, timeouts, error classification, and enforces
 client-side limits per technical requirements.
+
+The API key is passed in by the caller (Settings.jevstation_api_key, read from JEVSTATION_API_KEY in
+the process environment); the client never reads environment variables or .env files itself. It is held
+as a SecretStr and revealed only while building the Authorization header.
+
+Error messages are fixed strings plus status codes: never upstream text (httpx messages can hold URLs,
+response bodies and Jev's own `message` can echo input). Every error is raised by evaluate()/check_auth()
+outside the `except` block, after the httpx response is dropped: the sanitized error has no __cause__ or
+__context__, and no client frame on its traceback holds the upstream exception or response, whose request
+carries the Authorization header. `cause_type` keeps the upstream class name.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
-import os
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import certifi
 import httpx
+from pydantic import SecretStr
 
 
 class JevClientError(Exception):
@@ -61,35 +70,6 @@ class JevResponseError(JevClientError):
     pass
 
 
-def load_api_key_from_env_or_file() -> Optional[str]:
-    """
-    Safely retrieves JEVSTATION_API_KEY from environment or .env without leaking/printing.
-    """
-    # 1. Environment variable
-    key = os.environ.get("JEVSTATION_API_KEY")
-    if key and key.strip():
-        return key.strip()
-
-    # 2. Local .env file in cwd or repo root
-    search_paths = [
-        Path.cwd() / ".env",
-        Path(__file__).resolve().parents[2] / ".env",  # app/core/jev_client.py -> repo root
-    ]
-    for p in search_paths:
-        if p.is_file():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("JEVSTATION_API_KEY="):
-                            val = line.split("=", 1)[1].strip("\"' ")
-                            if val:
-                                return val
-            except (OSError, UnicodeDecodeError):
-                continue
-    return None
-
-
 class JevClient:
     """
     Async client for JevStation API (POST /api/v1/systemone).
@@ -101,7 +81,7 @@ class JevClient:
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: Union[SecretStr, str, None] = None,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         client: Optional[httpx.AsyncClient] = None,
@@ -113,11 +93,11 @@ class JevClient:
             or timeout <= 0
         ):
             raise ValueError("timeout must be a finite number of seconds > 0")
-        resolved_key = api_key or load_api_key_from_env_or_file()
-        if not resolved_key:
-            raise JevAuthError("JEVSTATION_API_KEY is missing. Configure it in .env or environment.")
+        secret = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key or "")
+        if not secret.get_secret_value().strip():
+            raise JevAuthError("JEVSTATION_API_KEY is missing. Export it in the process environment.")
 
-        self.api_key = resolved_key
+        self._api_key = secret
         self.base_url = base_url
         self.timeout = timeout
         import ssl
@@ -140,7 +120,7 @@ class JevClient:
 
     def _get_headers(self) -> Dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self._api_key.get_secret_value()}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "Switchyard/1.0",
@@ -171,76 +151,74 @@ class JevClient:
         else:
             payload["questions"] = questions
 
-        headers = self._get_headers()
-
         try:
             # httpx applies its timeout per phase (connect, write, read); this bounds the whole call.
             async with asyncio.timeout(self.timeout):
-                response = await self._client.post(
-                    self.base_url,
-                    headers=headers,
-                    json=payload,
-                )
+                response = await self._client.post(self.base_url, headers=self._get_headers(), json=payload)
         except (httpx.TimeoutException, TimeoutError) as exc:
-            raise JevTimeoutError(
-                f"JevStation evaluation timed out after {self.timeout}s: {exc}", cause_type=type(exc).__name__
-            ) from exc
+            failure = JevTimeoutError(
+                f"JevStation evaluation timed out after {self.timeout}s", cause_type=type(exc).__name__
+            )
         except httpx.RequestError as exc:
-            raise JevClientError(
-                f"Network error communicating with JevStation: {exc}", cause_type=type(exc).__name__
-            ) from exc
-
-        return self._handle_response(response)
+            failure = JevClientError("Network error communicating with JevStation", cause_type=type(exc).__name__)
+        else:
+            outcome = self._check_response(response)
+            del response  # Its request carries the Authorization header: keep it out of any traceback frame
+            if not isinstance(outcome, JevClientError):
+                return outcome
+            failure = outcome
+        raise failure from None  # Outside the except block: the upstream exception is not attached
 
     async def check_auth(self) -> Dict[str, Any]:
         """
         Executes the documented 0-credit GET authentication check.
         Returns account status, remaining credits, and model lists.
         """
-        headers = self._get_headers()
-
         try:
             async with asyncio.timeout(self.timeout):
-                response = await self._client.get(
-                    self.base_url,
-                    headers=headers,
-                )
+                response = await self._client.get(self.base_url, headers=self._get_headers())
         except (httpx.TimeoutException, TimeoutError) as exc:
-            raise JevTimeoutError(f"JevStation auth check timed out: {exc}", cause_type=type(exc).__name__) from exc
+            failure = JevTimeoutError("JevStation auth check timed out", cause_type=type(exc).__name__)
         except httpx.RequestError as exc:
-            raise JevClientError(f"Network error during auth check: {exc}", cause_type=type(exc).__name__) from exc
+            failure = JevClientError("Network error during auth check", cause_type=type(exc).__name__)
+        else:
+            outcome = self._check_response(response)
+            del response  # Its request carries the Authorization header: keep it out of any traceback frame
+            if not isinstance(outcome, JevClientError):
+                return outcome
+            failure = outcome
+        raise failure from None  # Outside the except block: the upstream exception is not attached
 
-        return self._handle_response(response)
-
-    def _handle_response(self, response: httpx.Response) -> Dict[str, Any]:
+    def _check_response(self, response: httpx.Response) -> Union[Dict[str, Any], JevClientError]:
+        """The JSON envelope, or the error to raise. Returned, not raised, so the caller can drop `response`
+        (its body and its request's Authorization header) before raising: no frame on the traceback holds it."""
         status = response.status_code
 
         if status == 401:
-            raise JevAuthError("Unauthorized: invalid or revoked JEVSTATION_API_KEY", status_code=status)
+            return JevAuthError("Unauthorized: invalid or revoked JEVSTATION_API_KEY", status_code=status)
         if status == 402:
-            raise JevCreditError("Payment required: insufficient JevStation credits", status_code=status)
+            return JevCreditError("Payment required: insufficient JevStation credits", status_code=status)
         if status == 429:
             retry_header = response.headers.get("Retry-After")
             retry_after = int(retry_header) if retry_header and retry_header.isdigit() else None
-            raise JevRateLimitError(
+            return JevRateLimitError(
                 "Rate limit exceeded on JevStation API", status_code=status, retry_after=retry_after
             )
         if status >= 500:
-            raise JevResponseError(f"JevStation server error (HTTP {status})", status_code=status)
+            return JevResponseError(f"JevStation server error (HTTP {status})", status_code=status)
         if status >= 400:
-            raise JevClientError(f"JevStation client error (HTTP {status}): {response.text[:200]}", status_code=status)
+            return JevClientError(f"JevStation client error (HTTP {status})", status_code=status)
 
         try:
             data = response.json()
-        except Exception as exc:
-            raise JevResponseError(f"Failed to parse JSON response: {exc}", status_code=status) from exc
+        except Exception:  # e.g. JSONDecodeError, whose .doc is the whole response body
+            return JevResponseError("Failed to parse JSON response", status_code=status)
 
         if not isinstance(data, dict):
-            raise JevResponseError("Invalid JSON envelope: expected object", status_code=status)
+            return JevResponseError("Invalid JSON envelope: expected object", status_code=status)
 
         code = data.get("code")
         if code is not None and code != 0:
-            msg = data.get("message", "Unknown error")
-            raise JevResponseError(f"JevStation error code {code}: {msg}", status_code=status)
+            return JevResponseError(f"JevStation error code {code}", status_code=status)  # Jev's message omitted
 
         return data

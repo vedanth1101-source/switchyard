@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     database_url: str | None = None  # DATABASE_URL, e.g. Neon pooled postgresql+psycopg://...
     redis_url: str | None = None  # REDIS_URL, e.g. Upstash rediss://...
     ai_gateway_api_key: SecretStr | None = None  # AI_GATEWAY_API_KEY
+    jevstation_api_key: SecretStr | None = None  # JEVSTATION_API_KEY (environment only; .env is not read)
     models_config_path: Path = DEFAULT_CONFIG_PATH  # MODELS_CONFIG_PATH
     # CONFIDENCE_THRESHOLD; the default is RoutingConfig's, so the two cannot disagree.
     confidence_threshold: float = Field(default=RoutingConfig.confidence_threshold, ge=0, le=1, allow_inf_nan=False)
@@ -43,7 +44,13 @@ class Settings(BaseSettings):
     rate_limit_ip_salt: SecretStr | None = None  # RATE_LIMIT_IP_SALT: HMAC key for rate-limit identities
 
     @field_validator(
-        "database_url", "redis_url", "ai_gateway_api_key", "client_ip_header", "rate_limit_ip_salt", mode="before"
+        "database_url",
+        "redis_url",
+        "ai_gateway_api_key",
+        "jevstation_api_key",
+        "client_ip_header",
+        "rate_limit_ip_salt",
+        mode="before",
     )
     @classmethod
     def blank_means_unset(cls, value: object) -> object:

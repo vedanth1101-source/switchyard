@@ -233,3 +233,46 @@ def test_client_ip_header_is_stripped_from_the_environment(clear_s2_6_env, monke
 
 def test_client_ip_header_argument_is_stripped():
     assert Settings(client_ip_header=" x-real-ip ").client_ip_header == "x-real-ip"
+
+
+# --- S2.7 Jev key ---------------------------------------------------------------------------
+
+JEV_CANARY_KEY = "jev-canary-key-S27-0123456789-not-real"
+
+
+def test_jev_key_defaults_to_none(monkeypatch):
+    monkeypatch.delenv("JEVSTATION_API_KEY", raising=False)
+
+    assert Settings().jevstation_api_key is None
+
+
+def test_jev_key_is_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("JEVSTATION_API_KEY", JEV_CANARY_KEY)
+
+    assert Settings().jevstation_api_key.get_secret_value() == JEV_CANARY_KEY
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"], ids=["empty", "spaces", "whitespace"])
+def test_blank_jev_key_is_unset(monkeypatch, blank):
+    monkeypatch.setenv("JEVSTATION_API_KEY", blank)
+
+    assert Settings().jevstation_api_key is None
+    assert Settings(jevstation_api_key=blank).jevstation_api_key is None
+
+
+def test_jev_key_is_never_rendered(monkeypatch):
+    monkeypatch.setenv("JEVSTATION_API_KEY", JEV_CANARY_KEY)
+    settings = Settings()
+
+    for rendered in (repr(settings), str(settings), settings.model_dump_json(), repr(settings.model_dump())):
+        assert JEV_CANARY_KEY not in rendered
+
+
+def test_validation_error_does_not_echo_the_jev_key(monkeypatch):
+    monkeypatch.setenv("JEVSTATION_API_KEY", JEV_CANARY_KEY)
+    monkeypatch.setenv("STRONG_DAILY_CAP", JEV_CANARY_KEY)  # The key pasted into the wrong variable too
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    assert JEV_CANARY_KEY not in str(excinfo.value)
