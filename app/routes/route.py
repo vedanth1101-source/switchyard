@@ -8,8 +8,10 @@ with fakes. A dry run skips the model call and never reserves strong budget, but
 Status codes: 200 success or dry run · 422 invalid request · 502 all models failed or the deadline
 was hit (body has `attempts`) · 503 the model gateway rejected every model (authentication or
 budget), or Jev / the gateway is not configured · 500 invalid model or routing configuration.
-Every response from this endpoint carries an X-Request-ID header equal to the body's request_id.
-Error bodies hold stable error codes only, never exception messages, paths, URLs or keys.
+Every response from this endpoint carries an X-Request-ID header equal to the body's request_id. The
+ID is the one app.main.RequestIdMiddleware assigned to the HTTP request (S2.1); route() and its log
+line use it too. Error bodies hold stable error codes only, never exception messages, paths, URLs or
+keys. 422 bodies are ValidationErrorResponse (built by app.main), without the submitted input.
 
 `cost` (S1.8) is a list-price estimate for the successful call only (Jev excluded); it is null for
 dry runs and when it cannot be calculated, never zero in that case.
@@ -18,11 +20,11 @@ Not implemented yet: cache (`use_cache` is accepted and ignored; `cache_hit` is 
 rate limiting / 429 (Sprint 2).
 """
 
+import dataclasses
 import logging
-import uuid
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -121,6 +123,27 @@ class RouteResponse(BaseModel):
     cost: Optional[CostOut]  # None for dry runs or when the cost cannot be calculated
 
 
+class ValidationErrorItem(BaseModel):
+    loc: list[Union[str, int]]
+    msg: str
+    type: str
+
+
+class ValidationErrorResponse(BaseModel):
+    """422 body. The submitted values are never echoed (no `input` or `ctx`)."""
+
+    request_id: str
+    error: Literal["invalid_request"]
+    detail: list[ValidationErrorItem]
+
+
+class InternalErrorResponse(BaseModel):
+    """Generic 500 for an unexpected exception (built by app.main.RequestIdMiddleware); no details."""
+
+    request_id: str
+    error: Literal["internal_error"]
+
+
 class RouteErrorResponse(BaseModel):
     request_id: str
     error: ErrorCode
@@ -139,26 +162,34 @@ def get_deps_factory() -> DepsFactory:
     "/route",
     response_model=RouteResponse,
     responses={
-        500: {"model": RouteErrorResponse, "description": "Invalid model or routing configuration"},
+        422: {"model": ValidationErrorResponse, "description": "Invalid request body"},
+        500: {
+            "model": Union[RouteErrorResponse, InternalErrorResponse],
+            "description": "Invalid model or routing configuration (RouteErrorResponse, error=configuration_error), "
+            "or an unexpected internal error (InternalErrorResponse)",
+        },
         502: {"model": RouteErrorResponse, "description": "All models failed or the request deadline was hit"},
         503: {"model": RouteErrorResponse, "description": "Model gateway or Jev unavailable or not configured"},
     },
 )
 async def route_prompt(
     body: RouteRequest,
+    request: Request,
     response: Response,
     settings: Settings = Depends(get_settings),
     deps_factory: DepsFactory = Depends(get_deps_factory),
 ) -> Any:
+    request_id: str = request.state.request_id
     try:
         async with deps_factory(settings, dry_run=body.dry_run) as deps:
+            deps = dataclasses.replace(deps, new_request_id=lambda: request_id)
             outcome = await route(body.prompt, dry_run=body.dry_run, deps=deps)
     except LLMAuthError as exc:
-        return _setup_error(503, "model_gateway_not_configured", exc)
+        return _setup_error(503, "model_gateway_not_configured", exc, request_id)
     except JevAuthError as exc:
-        return _setup_error(503, "classifier_not_configured", exc)
+        return _setup_error(503, "classifier_not_configured", exc, request_id)
     except (ModelConfigError, CliConfigurationError, RoutingConfigError) as exc:
-        return _setup_error(500, "configuration_error", exc)
+        return _setup_error(500, "configuration_error", exc, request_id)
 
     if outcome.status == "failed":
         return _failure(outcome)
@@ -222,8 +253,7 @@ def _failure(outcome: RouteOutcome) -> JSONResponse:
     return _json(status, body)
 
 
-def _setup_error(status: int, error: ErrorCode, exc: Exception) -> JSONResponse:
-    request_id = str(uuid.uuid4())
+def _setup_error(status: int, error: ErrorCode, exc: Exception, request_id: str) -> JSONResponse:
     # Exception type only: messages can contain file paths.
     logger.warning(
         "route request_id=%s status=%s error=%s error_type=%s",

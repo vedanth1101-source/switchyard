@@ -3,6 +3,7 @@
 import copy
 import dataclasses
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -121,7 +122,7 @@ def test_route_200_schema():
 
     assert response.status_code == 200
     body = response.json()
-    assert assert_request_id_header(response) == "req-api-1"
+    assert uuid.UUID(assert_request_id_header(response)).version == 4  # S2.1: the middleware assigns it
     assert set(body) == {
         "request_id",
         "dry_run",
@@ -256,7 +257,7 @@ def test_route_502_with_attempts_when_all_models_fail():
 
     assert response.status_code == 502
     body = response.json()
-    assert assert_request_id_header(response) == "req-api-1"
+    assert uuid.UUID(assert_request_id_header(response)).version == 4  # S2.1: the middleware assigns it
     assert body["error"] == "all_models_failed"
     assert [(a["model"], a["status"]) for a in body["attempts"]] == [
         (CHEAP[0], "client_error"),
@@ -362,6 +363,150 @@ def test_real_dependencies_with_unreadable_model_config_return_500(monkeypatch, 
     assert response.status_code == 500
     assert response.json()["error"] == "configuration_error"
     assert "missing-models.yaml" not in response.text
+
+
+# --- S2.1: one request ID per HTTP request -------------------------------------------------
+
+
+def route_log_request_ids(caplog) -> list[str]:
+    return [record.request_id for record in caplog.records if record.name == "app.core.router"]
+
+
+def test_success_header_body_and_route_log_share_the_middleware_request_id(caplog):
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])])
+
+    with caplog.at_level(logging.INFO, logger="app.core.router"):
+        response = harness.post({"prompt": PROMPT})
+
+    request_id = assert_request_id_header(response)
+    assert route_log_request_ids(caplog) == [request_id]
+    assert request_id != "req-api-1"  # the deps' own generator is replaced on the HTTP path
+
+
+def test_failure_header_body_and_route_log_share_one_request_id(caplog):
+    harness = ApiHarness(EASY_JEV, [client_error(), client_error()])
+
+    with caplog.at_level(logging.INFO, logger="app.core.router"):
+        response = harness.post({"prompt": PROMPT})
+
+    assert response.status_code == 502
+    assert route_log_request_ids(caplog) == [assert_request_id_header(response)]
+
+
+def test_setup_error_uses_the_middleware_request_id_in_body_header_and_log(caplog):
+    client = client_with_failing_factory(JevAuthError("JEVSTATION_API_KEY is missing"))
+
+    with caplog.at_level(logging.INFO, logger="app.routes.route"):
+        response = client.post("/api/route", json={"prompt": PROMPT})
+
+    assert response.status_code == 503
+    request_id = assert_request_id_header(response)
+    assert [record.request_id for record in caplog.records if record.name == "app.routes.route"] == [request_id]
+
+
+def test_inbound_request_id_is_not_used_by_the_route():
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])])
+
+    response = harness.client.post("/api/route", json={"prompt": PROMPT}, headers={"X-Request-ID": "client-id"})
+
+    assert assert_request_id_header(response) != "client-id"
+
+
+def test_unexpected_exception_is_a_generic_500_with_a_sanitized_log(caplog):
+    client = client_with_failing_factory(RuntimeError(f"boom {PROMPT} {FAKE_KEY} C:/secret/path"))
+
+    with caplog.at_level(logging.INFO):
+        response = client.post("/api/route", json={"prompt": PROMPT})
+
+    assert response.status_code == 500
+    request_id = assert_request_id_header(response)
+    assert response.json() == {"request_id": request_id, "error": "internal_error"}
+    errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert [(record.request_id, record.error_type) for record in errors] == [(request_id, "RuntimeError")]
+    for secret in ("PROMPT-MARKER", FAKE_KEY, "secret/path", "Traceback"):
+        assert secret not in caplog.text
+        assert secret not in response.text
+
+
+def test_unexpected_jev_exception_is_a_generic_500_not_a_jev_error():
+    harness = ApiHarness(RuntimeError("Jev SDK bug PROMPT-MARKER"), [ok(CHEAP[0])])
+
+    response = harness.post({"prompt": PROMPT})
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "internal_error"
+    assert harness.llm.calls == []
+
+
+# --- S2.1: the documented 500 schema matches the real 500 bodies ----------------------------
+
+JSON_TYPES = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def matches_schema(spec: dict, schema: dict, value) -> bool:
+    """Minimal JSON Schema check for the keywords FastAPI emits here (no jsonschema dependency)."""
+    if "$ref" in schema:
+        return matches_schema(spec, spec["components"]["schemas"][schema["$ref"].rsplit("/", 1)[-1]], value)
+    if "anyOf" in schema:
+        return any(matches_schema(spec, option, value) for option in schema["anyOf"])
+    if "oneOf" in schema:
+        return sum(matches_schema(spec, option, value) for option in schema["oneOf"]) == 1
+    if "const" in schema and value != schema["const"]:
+        return False
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    if "type" in schema:
+        if isinstance(value, bool) and schema["type"] in ("integer", "number"):
+            return False
+        if not isinstance(value, JSON_TYPES[schema["type"]]):
+            return False
+    if isinstance(value, dict):
+        if not set(schema.get("required", [])) <= set(value):
+            return False
+        properties = schema.get("properties", {})
+        return all(matches_schema(spec, properties[key], item) for key, item in value.items() if key in properties)
+    if isinstance(value, list) and "items" in schema:
+        return all(matches_schema(spec, schema["items"], item) for item in value)
+    return True
+
+
+def documented_route_500() -> tuple[dict, dict]:
+    spec = create_app().openapi()
+    return spec, spec["paths"]["/api/route"]["post"]["responses"]["500"]["content"]["application/json"]["schema"]
+
+
+def test_generic_unhandled_500_body_matches_the_documented_500_schema():
+    response = client_with_failing_factory(RuntimeError("bug")).post("/api/route", json={"prompt": PROMPT})
+    spec, schema = documented_route_500()
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "internal_error"
+    assert matches_schema(spec, schema, response.json())
+
+
+def test_configuration_error_500_body_still_matches_the_documented_500_schema():
+    response = client_with_failing_factory(ModelConfigError("bad config")).post("/api/route", json={"prompt": PROMPT})
+    spec, schema = documented_route_500()
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "configuration_error"
+    assert matches_schema(spec, schema, response.json())
+
+
+def test_documented_500_schema_rejects_bodies_outside_both_contracts():
+    spec, schema = documented_route_500()
+
+    assert not matches_schema(spec, schema, {"request_id": "r", "error": "something_else"})
+    assert not matches_schema(spec, schema, {"error": "internal_error"})
+    assert not matches_schema(spec, schema, {"request_id": "r", "error": "configuration_error"})  # route fields missing
 
 
 # --- Routing table --------------------------------------------------------------------------
