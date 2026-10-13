@@ -158,3 +158,78 @@ def test_budget_bound_matches_vercel_max_duration():
 
     assert vercel["functions"]["app/main.py"]["maxDuration"] == FUNCTION_MAX_DURATION_SECONDS
     assert Settings().request_budget_seconds < FUNCTION_MAX_DURATION_SECONDS
+
+
+# --- S2.6 rate limit ------------------------------------------------------------------------
+
+S2_6_ENV_VARS = ("RATE_LIMIT_PER_MIN", "CLIENT_IP_HEADER", "RATE_LIMIT_IP_SALT")
+FAKE_SALT = "fake-rate-limit-salt-for-tests-0123456789"
+
+
+@pytest.fixture
+def clear_s2_6_env(monkeypatch):
+    for name in S2_6_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_rate_limit_defaults(clear_s2_6_env):
+    settings = Settings()
+
+    assert (settings.rate_limit_per_min, settings.client_ip_header, settings.rate_limit_ip_salt) == (10, None, None)
+
+
+def test_rate_limit_environment_overrides(clear_s2_6_env, monkeypatch):
+    monkeypatch.setenv("RATE_LIMIT_PER_MIN", "25")
+    monkeypatch.setenv("CLIENT_IP_HEADER", "x-real-ip")
+    monkeypatch.setenv("RATE_LIMIT_IP_SALT", FAKE_SALT)
+
+    settings = Settings()
+
+    assert (settings.rate_limit_per_min, settings.client_ip_header) == (25, "x-real-ip")
+    assert settings.rate_limit_ip_salt.get_secret_value() == FAKE_SALT
+
+
+@pytest.mark.parametrize("name", ["CLIENT_IP_HEADER", "RATE_LIMIT_IP_SALT"])
+@pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "spaces"])
+def test_blank_rate_limit_strings_are_unset(clear_s2_6_env, monkeypatch, name, blank):
+    monkeypatch.setenv(name, blank)
+
+    assert getattr(Settings(), name.lower()) is None
+
+
+def test_blank_rate_limit_arguments_are_unset():
+    settings = Settings(client_ip_header="  ", rate_limit_ip_salt="  ")
+
+    assert (settings.client_ip_header, settings.rate_limit_ip_salt) == (None, None)
+
+
+def test_rate_limit_salt_is_never_rendered(clear_s2_6_env, monkeypatch):
+    monkeypatch.setenv("RATE_LIMIT_IP_SALT", FAKE_SALT)
+    settings = Settings()
+
+    for rendered in (repr(settings), str(settings), settings.model_dump_json(), repr(settings.model_dump())):
+        assert FAKE_SALT not in rendered
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "ten", "1.5"])
+def test_invalid_rate_limit_fails_naming_the_field_without_the_input(clear_s2_6_env, monkeypatch, value):
+    monkeypatch.setenv("RATE_LIMIT_PER_MIN", value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    assert "rate_limit_per_min" in str(excinfo.value)
+    assert "input_value" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "raw", ["  x-real-ip  ", "\tx-real-ip\n", "x-real-ip "], ids=["spaces", "tab-newline", "trailing"]
+)
+def test_client_ip_header_is_stripped_from_the_environment(clear_s2_6_env, monkeypatch, raw):
+    monkeypatch.setenv("CLIENT_IP_HEADER", raw)
+
+    assert Settings().client_ip_header == "x-real-ip"
+
+
+def test_client_ip_header_argument_is_stripped():
+    assert Settings(client_ip_header=" x-real-ip ").client_ip_header == "x-real-ip"

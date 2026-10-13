@@ -8,12 +8,15 @@ import logging
 import threading
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
+import fakeredis
 import httpx
 import pytest
 import sqlalchemy
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from app.core.jev_client import JevAuthError, JevClientError, JevTimeoutError
 from app.core.llm_client import (
@@ -31,9 +34,10 @@ from app.core.router import CliConfigurationError, RouterDeps
 from app.core.settings import get_settings
 from app.db.repo import OutcomeRowsError
 from app.infra.db import get_engine
+from app.infra.ratelimit import RedisRateLimiter
 from app.main import create_app
 from app.routes import route as route_api
-from tests.fakes import FakeBudget, FakeClock, FakeJev, FakeLLM, RecordingSleep
+from tests.fakes import FakeBudget, FakeClock, FakeJev, FakeLLM, FakeRateLimiter, RecordingSleep
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PROMPT = "Write a function to check primes PROMPT-MARKER"
@@ -71,8 +75,13 @@ def client_error() -> LLMClientError:
     return LLMClientError("m: HTTP 400: request rejected", status_code=400)
 
 
+REAL_LIMITER = object()  # ApiHarness(limiter=REAL_LIMITER) keeps the real get_rate_limiter dependency
+
+
 class ApiHarness:
-    def __init__(self, jev_outcome=EASY_JEV, script=(), budget=None, jev_seconds=0.0, config=CONFIG, recorder=None):
+    def __init__(
+        self, jev_outcome=EASY_JEV, script=(), budget=None, jev_seconds=0.0, config=CONFIG, recorder=None, limiter=None
+    ):
         self.clock = FakeClock()
         self.jev = FakeJev(jev_outcome, self.clock, jev_seconds)
         self.budget = budget or FakeBudget()
@@ -92,6 +101,9 @@ class ApiHarness:
         app.dependency_overrides[route_api.get_deps_factory] = lambda: self.factory
         if recorder is not None:  # Otherwise the real recorder (a no-op without DATABASE_URL)
             app.dependency_overrides[route_api.get_outcome_recorder] = lambda: recorder
+        self.limiter = FakeRateLimiter() if limiter is None else limiter  # Allows every request by default
+        if self.limiter is not REAL_LIMITER:
+            app.dependency_overrides[route_api.get_rate_limiter] = lambda: self.limiter
         self.client = TestClient(app)
 
     @asynccontextmanager
@@ -99,8 +111,8 @@ class ApiHarness:
         self.factory_calls.append(dry_run)
         yield self.deps
 
-    def post(self, body: dict) -> httpx.Response:
-        return self.client.post("/api/route", json=body)
+    def post(self, body: dict, headers: dict | None = None) -> httpx.Response:
+        return self.client.post("/api/route", json=body, headers=headers)
 
 
 def client_with_failing_factory(error: Exception, recorder=None) -> TestClient:
@@ -111,6 +123,7 @@ def client_with_failing_factory(error: Exception, recorder=None) -> TestClient:
 
     app = create_app()
     app.dependency_overrides[route_api.get_deps_factory] = lambda: factory
+    app.dependency_overrides[route_api.get_rate_limiter] = FakeRateLimiter
     if recorder is not None:
         app.dependency_overrides[route_api.get_outcome_recorder] = lambda: recorder
     return TestClient(app)
@@ -887,3 +900,235 @@ def test_real_recorder_with_an_unusable_database_url_fails_open(caplog, monkeypa
     assert [r.error_type for r in failures] == ["ArgumentError"]
     assert SQL_SECRET not in caplog.text
     get_engine.cache_clear()
+
+
+# --- S2.6: per-IP rate limit ----------------------------------------------------------------
+
+LIMITED_IP = "203.0.113.7"
+FORWARDED_IP = "198.51.100.23"
+RATE_SALT = "api-test-salt-not-a-real-secret"
+
+
+def test_route_429_with_retry_after():
+    recorder = FakeRecorder()
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])], recorder=recorder, limiter=FakeRateLimiter(False, 17))
+
+    response = harness.post({"prompt": PROMPT})
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "17"
+    request_id = assert_request_id_header(response)
+    assert response.json() == {
+        "request_id": request_id,
+        "error": "rate_limited",
+        "decision": None,
+        "attempts": [],
+        "total_latency_ms": None,
+        "config_version": None,
+    }
+    # Nothing downstream ran: no dependencies built, no Jev call, no strong budget, nothing persisted.
+    assert harness.factory_calls == []
+    assert harness.jev.calls == []
+    assert (harness.budget.available_calls, harness.budget.reserve_calls) == (0, 0)
+    assert harness.llm.calls == []
+    assert recorder.calls == []
+
+
+def test_allowed_request_is_checked_once_against_the_socket_peer_then_routed():
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])])
+
+    response = harness.post({"prompt": PROMPT}, headers={"X-Forwarded-For": FORWARDED_IP, "X-Real-IP": FORWARDED_IP})
+
+    assert response.status_code == 200
+    assert harness.limiter.calls == ["testclient"]  # TestClient's peer; forwarded headers are not trusted
+    assert harness.factory_calls == [False]
+
+
+def test_configured_client_ip_header_is_the_rate_limit_identity(monkeypatch):
+    monkeypatch.setenv("CLIENT_IP_HEADER", "x-real-ip")
+    get_settings.cache_clear()
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])])
+
+    response = harness.post({"prompt": PROMPT}, headers={"X-Real-IP": LIMITED_IP, "X-Forwarded-For": FORWARDED_IP})
+
+    assert response.status_code == 200
+    assert harness.limiter.calls == [LIMITED_IP]
+
+
+def test_dry_runs_count_against_the_rate_limit():
+    harness = ApiHarness(EASY_JEV)
+
+    assert harness.post({"prompt": PROMPT, "dry_run": True}).status_code == 200
+    assert harness.limiter.calls == ["testclient"]
+
+
+@pytest.mark.parametrize("body", [{}, {"prompt": ""}, {"prompt": "x" * 8001}], ids=["missing", "empty", "too-long"])
+def test_invalid_body_is_a_422_and_is_not_counted(body):
+    harness = ApiHarness(EASY_JEV)
+
+    response = harness.post(body)
+
+    assert response.status_code == 422
+    assert harness.limiter.calls == []
+
+
+def test_429_log_has_the_request_id_and_no_client_ip(caplog, monkeypatch):
+    monkeypatch.setenv("CLIENT_IP_HEADER", "x-real-ip")
+    get_settings.cache_clear()
+    harness = ApiHarness(EASY_JEV, limiter=FakeRateLimiter(False, 5))
+
+    with caplog.at_level(logging.DEBUG):
+        response = harness.post({"prompt": PROMPT}, headers={"X-Real-IP": LIMITED_IP})
+
+    records = [r for r in caplog.records if r.name == "app.routes.route"]
+    assert [(r.levelno, r.request_id, r.error) for r in records] == [
+        (logging.INFO, response.headers["X-Request-ID"], "rate_limited")
+    ]
+    assert LIMITED_IP not in caplog.text
+    assert PROMPT not in caplog.text
+
+
+def test_real_limiter_without_redis_fails_open_with_one_sanitized_warning(caplog, monkeypatch):
+    monkeypatch.setenv("RATE_LIMIT_IP_SALT", RATE_SALT)
+    get_settings.cache_clear()
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])], limiter=REAL_LIMITER)
+
+    with caplog.at_level(logging.DEBUG, logger="app.infra.ratelimit"):
+        response = harness.post({"prompt": PROMPT})
+
+    assert response.status_code == 200
+    assert harness.factory_calls == [False]
+    records = [r for r in caplog.records if r.name == "app.infra.ratelimit"]
+    assert [(r.levelno, r.reason, r.error_type) for r in records] == [(logging.WARNING, "redis_not_configured", None)]
+    assert RATE_SALT not in caplog.text
+
+
+def test_real_limiter_without_a_salt_fails_open_without_contacting_redis(caplog, monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://default:super-secret-password@127.0.0.1:1/0")
+    get_settings.cache_clear()
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])], limiter=REAL_LIMITER)
+
+    with caplog.at_level(logging.DEBUG, logger="app.infra.ratelimit"):
+        response = harness.post({"prompt": PROMPT})
+
+    assert response.status_code == 200
+    records = [r for r in caplog.records if r.name == "app.infra.ratelimit"]
+    assert [(r.reason, r.error_type) for r in records] == [("salt_not_configured", None)]
+    assert "super-secret-password" not in caplog.text
+
+
+def test_redis_backed_limit_admits_ten_then_429s_before_any_dependency(monkeypatch):
+    server = fakeredis.FakeServer()
+    now = datetime(2026, 10, 13, 12, 0, 45, tzinfo=timezone.utc)
+
+    async def limiter_on_fake_redis():
+        client = fakeredis.FakeAsyncRedis(server=server)
+        try:
+            yield RedisRateLimiter(client, limit=10, salt=SecretStr(RATE_SALT), now=lambda: now)
+        finally:
+            await client.aclose()
+
+    harness = ApiHarness(EASY_JEV)
+    harness.client.app.dependency_overrides[route_api.get_rate_limiter] = limiter_on_fake_redis
+
+    statuses = [harness.post({"prompt": PROMPT, "dry_run": True}).status_code for _ in range(10)]
+    blocked = harness.post({"prompt": PROMPT, "dry_run": True})
+
+    assert statuses == [200] * 10
+    assert blocked.status_code == 429
+    assert blocked.headers["Retry-After"] == "15"
+    assert len(harness.factory_calls) == 10  # The 11th request built nothing
+
+
+def test_openapi_documents_the_429():
+    spec = TestClient(create_app()).get("/api/openapi.json").json()
+    responses = spec["paths"]["/api/route"]["post"]["responses"]
+
+    assert "429" in responses
+    assert responses["429"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/RouteErrorResponse"
+    }
+    assert "rate_limited" in json.dumps(spec["components"]["schemas"]["RouteErrorResponse"])
+
+
+def test_client_ip_header_with_surrounding_whitespace_still_selects_the_header(monkeypatch):
+    monkeypatch.setenv("CLIENT_IP_HEADER", "  X-Real-IP \t")
+    get_settings.cache_clear()
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])])
+
+    response = harness.post({"prompt": PROMPT}, headers={"X-Real-IP": LIMITED_IP})
+
+    assert response.status_code == 200
+    assert harness.limiter.calls == [LIMITED_IP]  # Not the socket peer
+
+
+class TrackingLimiter(FakeRateLimiter):
+    """Stands in for create_rate_limiter()'s result to observe the real dependency's lifecycle."""
+
+    def __init__(self, allowed=True, retry_after_seconds=None, error: Exception | None = None):
+        super().__init__(allowed, retry_after_seconds)
+        self.error = error
+        self.closed = 0
+
+    async def check(self, client_ip):
+        if self.error is not None:
+            raise self.error
+        return await super().check(client_ip)
+
+    async def aclose(self):
+        self.closed += 1
+
+
+def track_real_limiter(monkeypatch, limiter: TrackingLimiter) -> list:
+    built = []
+
+    def create(settings):
+        built.append(limiter)
+        return limiter
+
+    monkeypatch.setattr(route_api, "create_rate_limiter", create)
+    return built
+
+
+@pytest.mark.parametrize(
+    ("limiter", "body", "status", "checked"),
+    [
+        (TrackingLimiter(), {"prompt": PROMPT}, 200, 1),
+        (TrackingLimiter(False, 9), {"prompt": PROMPT}, 429, 1),
+        (TrackingLimiter(), {"prompt": ""}, 422, 0),
+    ],
+    ids=["allowed", "rate-limited", "invalid-body"],
+)
+def test_real_dependency_builds_one_limiter_per_request_and_closes_it(monkeypatch, limiter, body, status, checked):
+    built = track_real_limiter(monkeypatch, limiter)
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])], limiter=REAL_LIMITER)
+
+    response = harness.post(body)
+
+    assert response.status_code == status
+    assert (len(built), len(limiter.calls), limiter.closed) == (1, checked, 1)
+
+
+def test_real_dependency_closes_the_limiter_after_a_setup_error(monkeypatch):
+    limiter = TrackingLimiter()
+    track_real_limiter(monkeypatch, limiter)
+    app = client_with_failing_factory(JevAuthError("no key")).app
+    del app.dependency_overrides[route_api.get_rate_limiter]
+
+    response = TestClient(app).post("/api/route", json={"prompt": PROMPT})
+
+    assert response.status_code == 503
+    assert limiter.closed == 1
+
+
+def test_real_dependency_closes_the_limiter_when_the_check_raises_unexpectedly(monkeypatch):
+    limiter = TrackingLimiter(error=RuntimeError("limiter bug"))
+    track_real_limiter(monkeypatch, limiter)
+    harness = ApiHarness(EASY_JEV, limiter=REAL_LIMITER)
+
+    response = harness.post({"prompt": PROMPT})
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "internal_error"
+    assert harness.factory_calls == []  # Never fails open on a bug
+    assert limiter.closed == 1

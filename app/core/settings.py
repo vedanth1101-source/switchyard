@@ -37,13 +37,25 @@ class Settings(BaseSettings):
     )
     # JEV_TIMEOUT_SECONDS: limit for the whole Jev call. Jev time counts against REQUEST_BUDGET_SECONDS.
     jev_timeout_seconds: float = Field(default=JevClient.DEFAULT_TIMEOUT_SECONDS, gt=0, allow_inf_nan=False)
+    rate_limit_per_min: int = Field(default=10, ge=1)  # RATE_LIMIT_PER_MIN: /api/route requests per client IP
+    # CLIENT_IP_HEADER: trusted header holding the client IP (x-real-ip on Vercel); unset = socket peer.
+    client_ip_header: str | None = None
+    rate_limit_ip_salt: SecretStr | None = None  # RATE_LIMIT_IP_SALT: HMAC key for rate-limit identities
 
-    @field_validator("database_url", "redis_url", "ai_gateway_api_key", mode="before")
+    @field_validator(
+        "database_url", "redis_url", "ai_gateway_api_key", "client_ip_header", "rate_limit_ip_salt", mode="before"
+    )
     @classmethod
     def blank_means_unset(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("client_ip_header")
+    @classmethod
+    def strip_header_name(cls, value: str | None) -> str | None:
+        # A padded name ("x-real-ip ") would never match a request header, silently falling back to the peer.
+        return value.strip() if value is not None else None
 
 
 @lru_cache

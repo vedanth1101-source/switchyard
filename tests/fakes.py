@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Sequence, Tuple, Union
 
 from app.core.llm_client import LLMError, ModelResult
+from app.infra.ratelimit import RateLimitDecision
 
 
 class FakeClock:
@@ -110,3 +111,16 @@ class FakeBudget:
     async def reserve(self) -> bool:
         self.reserve_calls += 1
         return self._reserve
+
+
+class FakeRateLimiter:
+    """RateLimiter that records the client IPs it was asked about and answers with a fixed decision."""
+
+    def __init__(self, allowed: bool = True, retry_after_seconds: int | None = None):
+        self.allowed = allowed
+        self.retry_after_seconds = retry_after_seconds
+        self.calls: List[str] = []
+
+    async def check(self, client_ip: str) -> RateLimitDecision:
+        self.calls.append(client_ip)
+        return RateLimitDecision(allowed=self.allowed, retry_after_seconds=self.retry_after_seconds)

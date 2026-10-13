@@ -23,14 +23,19 @@ fails (SQLAlchemyError) or outcome_to_rows refuses the outcome (OutcomeRowsError
 unchanged and one warning with the request ID and exception type is logged. Any other exception is a
 bug and reaches the generic 500. Without DATABASE_URL nothing is saved (one INFO line per request).
 
-Not implemented yet: cache (`use_cache` is accepted and ignored; `cache_hit` is omitted), per-IP
-rate limiting / 429 (Sprint 2).
+Rate limit (S2.6): the first statement of the handler, so after FastAPI has validated the body (a 422
+is never counted) and before any dependency is built. A refused request gets 429 with a Retry-After
+header and a RouteErrorResponse (error=rate_limited); it never builds clients, calls Jev, touches the
+strong budget or is persisted. See app.infra.ratelimit for the window, the client identity and why a
+missing Redis or salt fails open.
+
+Not implemented yet: cache (`use_cache` is accepted and ignored; `cache_hit` is omitted).
 """
 
 import dataclasses
 import functools
 import logging
-from typing import Any, Awaitable, Callable, Literal, Optional, Union
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
@@ -48,12 +53,14 @@ from app.core.router import CliConfigurationError, DepsFactory, RouteOutcome, bu
 from app.core.settings import Settings, get_settings
 from app.db.repo import OutcomeRowsError, outcome_to_rows, save_outcome
 from app.infra.db import get_engine
+from app.infra.ratelimit import RateLimiter, create_rate_limiter, resolve_client_ip
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_PROMPT_CHARS = 8000
 REQUEST_ID_HEADER = "X-Request-ID"
+RETRY_AFTER_HEADER = "Retry-After"
 
 ErrorCode = Literal[
     "all_models_failed",
@@ -62,6 +69,7 @@ ErrorCode = Literal[
     "model_gateway_not_configured",
     "classifier_not_configured",
     "configuration_error",
+    "rate_limited",
 ]
 
 
@@ -170,6 +178,15 @@ def get_deps_factory() -> DepsFactory:
     return build_cli_deps
 
 
+async def get_rate_limiter(settings: Settings = Depends(get_settings)) -> AsyncIterator[RateLimiter]:
+    """Per-request limiter from Settings (built without connecting, closed afterwards); tests override this."""
+    limiter = create_rate_limiter(settings)
+    try:
+        yield limiter
+    finally:
+        await limiter.aclose()
+
+
 OutcomeRecorder = Callable[[RouteOutcome, str], Awaitable[None]]
 
 
@@ -198,6 +215,7 @@ async def record_outcome(outcome: RouteOutcome, prompt: str, *, database_url: Op
     response_model=RouteResponse,
     responses={
         422: {"model": ValidationErrorResponse, "description": "Invalid request body"},
+        429: {"model": RouteErrorResponse, "description": "Rate limited (error=rate_limited); see Retry-After"},
         500: {
             "model": Union[RouteErrorResponse, InternalErrorResponse],
             "description": "Invalid model or routing configuration (RouteErrorResponse, error=configuration_error), "
@@ -214,8 +232,13 @@ async def route_prompt(
     settings: Settings = Depends(get_settings),
     deps_factory: DepsFactory = Depends(get_deps_factory),
     recorder: OutcomeRecorder = Depends(get_outcome_recorder),
+    limiter: RateLimiter = Depends(get_rate_limiter),
 ) -> Any:
+    peer = request.client.host if request.client is not None else None
+    limit = await limiter.check(resolve_client_ip(request.headers, peer, settings.client_ip_header))
     request_id: str = request.state.request_id
+    if limit.retry_after_seconds is not None:  # Refused; RateLimitDecision guarantees a wait of >= 1 s
+        return _rate_limited(request_id, limit.retry_after_seconds)
     try:
         async with deps_factory(settings, dry_run=body.dry_run) as deps:
             deps = dataclasses.replace(deps, new_request_id=lambda: request_id)
@@ -319,6 +342,20 @@ def _setup_error(status: int, error: ErrorCode, exc: Exception, request_id: str)
         request_id=request_id, error=error, decision=None, attempts=[], total_latency_ms=None, config_version=None
     )
     return _json(status, body)
+
+
+def _rate_limited(request_id: str, retry_after_seconds: int) -> JSONResponse:
+    error: ErrorCode = "rate_limited"
+    # No client IP or identity: the request ID is enough to correlate.
+    logger.info(
+        "route request_id=%s status=429 error=%s", request_id, error, extra={"request_id": request_id, "error": error}
+    )
+    body = RouteErrorResponse(
+        request_id=request_id, error=error, decision=None, attempts=[], total_latency_ms=None, config_version=None
+    )
+    response = _json(429, body)
+    response.headers[RETRY_AFTER_HEADER] = str(retry_after_seconds)
+    return response
 
 
 def _json(status: int, body: RouteErrorResponse) -> JSONResponse:
