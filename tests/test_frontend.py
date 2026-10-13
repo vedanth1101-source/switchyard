@@ -4,12 +4,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main
+from app.core.model_config import load_model_config
+from app.core.settings import Settings
 from app.main import create_app
 from app.routes import health
 
 HTML = {"accept": "text/html"}
 SPA_MARKER = '<div id="root">switchyard-test-shell</div>'
-HEALTHY = {"status": "ok", "db": "ok", "redis": "ok"}
+_SETTINGS = Settings()  # The values the app reads too (MODELS_CONFIG_PATH, CONFIDENCE_THRESHOLD)
+_VERSION = load_model_config(_SETTINGS.models_config_path, confidence_threshold=_SETTINGS.confidence_threshold)
+HEALTHY = {"status": "ok", "config_version": _VERSION.config_version, "db": "ok", "redis": "ok"}
 
 
 def with_healthy_services(test_app):

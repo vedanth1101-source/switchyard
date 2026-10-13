@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
+from app.core.model_config import load_model_config
 from app.core.settings import get_settings
 from app.main import create_app
 
@@ -54,5 +55,7 @@ def test_health_reports_db_and_redis():
 
     response = TestClient(create_app()).get("/api/health")
 
+    settings = get_settings()
+    version = load_model_config(settings.models_config_path, confidence_threshold=settings.confidence_threshold)
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok", "redis": "ok"}
+    assert response.json() == {"status": "ok", "config_version": version.config_version, "db": "ok", "redis": "ok"}
