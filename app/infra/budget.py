@@ -11,8 +11,9 @@ billed; the cheap fallback inside the executor never reserves. Denied reservatio
 the counter, so it counts reservation attempts; available() is unaffected because the count is
 already at the cap.
 
-Fail closed: when Redis is unconfigured or fails, strong budget is unavailable, so the policy
-routes cheap (reason BUDGET). Logs carry only the exception type, never URLs or credentials.
+Fail closed: when Redis is unconfigured or fails, or today's counter is not an integer, strong budget
+is unavailable, so the policy routes cheap (reason BUDGET). Logs carry only the exception type, never
+URLs, credentials or the stored value.
 """
 
 from __future__ import annotations
@@ -87,7 +88,12 @@ class RedisStrongBudget:
         except REDIS_ERRORS as exc:
             _log_failure("available", exc)
             return False
-        return int(count or 0) < self.daily_cap
+        try:
+            used = 0 if count is None else int(count)
+        except ValueError as exc:  # Corrupt (non-integer) counter: fail closed, as reserve()'s INCR does
+            _log_failure("available", exc)
+            return False
+        return used < self.daily_cap
 
     async def reserve(self) -> bool:
         """Atomically takes one unit of today's budget. False if over the cap or on Redis failure."""

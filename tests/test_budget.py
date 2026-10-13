@@ -224,6 +224,42 @@ def test_unexpected_error_is_not_swallowed():
         asyncio.run(budget.reserve())
 
 
+# --- Corrupt counter (S2.2): fail closed in available() like reserve() ----------------------
+
+
+@pytest.mark.parametrize("value", [b"not-a-number", b"3.5", b""], ids=["text", "float", "empty"])
+def test_corrupt_counter_fails_closed_and_logs_only_the_error_type(caplog, value):
+    async def scenario():
+        budget, client = make_budget(cap=5)
+        await client.set(budget_key(DAY.date()), value)
+        return await budget.available(), await budget.reserve(), await client.get(budget_key(DAY.date()))
+
+    with caplog.at_level(logging.WARNING, logger="app.infra.budget"):
+        available, reserved, stored = asyncio.run(scenario())
+
+    assert (available, reserved) == (False, False)
+    assert stored == value  # never repaired or overwritten
+    assert [(record.operation, record.error_type) for record in caplog.records] == [
+        ("available", "ValueError"),
+        ("reserve", "ResponseError"),
+    ]
+    if value:
+        assert value.decode() not in caplog.text
+
+
+def test_naive_clock_is_still_rejected_by_available():
+    budget, _ = make_budget(cap=3, now=lambda: datetime(2026, 10, 12, 15, 0))
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        asyncio.run(budget.available())
+
+
+def test_missing_counter_is_still_available():
+    budget, _ = make_budget(cap=1)
+
+    assert asyncio.run(budget.available()) is True
+
+
 # --- Factory --------------------------------------------------------------------------------
 
 

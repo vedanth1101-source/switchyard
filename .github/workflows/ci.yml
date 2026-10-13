@@ -99,12 +99,24 @@ jobs:
           FASTAPI_ENV: production
         run: >-
           pytest -m integration -rA --junitxml="$RUNNER_TEMP/integration.xml"
-          tests/test_health_integration.py tests/test_migrations_integration.py
+          tests/test_health_integration.py tests/test_migrations_integration.py tests/test_budget_integration.py
       - name: Require the integration tests to have run and passed (not skipped)
         run: |
           python - <<'EOF'
           import os, sys, xml.etree.ElementTree as ET
-          REQUIRED = {"test_health_reports_db_and_redis", "test_migrations_upgrade_downgrade_round_trip"}
+          REQUIRED = {
+              "test_health_reports_db_and_redis",
+              "test_migrations_upgrade_downgrade_round_trip",
+              "test_cap_allows_exactly_three_of_five_and_counts_denied_reservations",
+              "test_concurrent_reservations_across_independent_clients_never_exceed_the_cap",
+              "test_concurrent_reservations_at_cap_minus_one_allow_exactly_one",
+              "test_reservation_sets_the_two_day_ttl",
+              "test_reservation_adds_a_ttl_to_an_existing_key_without_one",
+              "test_expired_counter_resets_the_budget",
+              "test_utc_midnight_starts_a_new_key_and_leaves_the_previous_day_unchanged",
+              "test_closed_local_port_fails_closed_without_logging_the_url",
+              "test_corrupt_counter_fails_closed_in_available_and_reserve",
+          }
           root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "integration.xml")).getroot()
           cases = list(root.iter("testcase"))
           bad = [c.get("name") for c in cases if c.find("skipped") is not None
