@@ -11,9 +11,10 @@ the wrong variable is not echoed into logs.
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.executor import CALL_MARGIN_SECONDS, MIN_CALL_SECONDS
 from app.core.jev_client import JevClient
 from app.core.model_config import DEFAULT_CONFIG_PATH
 from app.core.policy import RoutingConfig
@@ -63,6 +64,17 @@ class Settings(BaseSettings):
     def strip_header_name(cls, value: str | None) -> str | None:
         # A padded name ("x-real-ip ") would never match a request header, silently falling back to the peer.
         return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def jev_timeout_leaves_room_for_a_model_call(self) -> "Settings":
+        # Jev time counts against the request budget; after a Jev call that uses its whole timeout, the
+        # executor must still be able to start one model call (S2.9). Field names only, never values.
+        if self.jev_timeout_seconds + MIN_CALL_SECONDS + CALL_MARGIN_SECONDS >= self.request_budget_seconds:
+            raise ValueError(
+                "jev_timeout_seconds + MIN_CALL_SECONDS + CALL_MARGIN_SECONDS must be less than "
+                "request_budget_seconds, so a model call can still start after a Jev call times out"
+            )
+        return self
 
 
 @lru_cache

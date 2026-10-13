@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from app.core.executor import CALL_MARGIN_SECONDS, MIN_CALL_SECONDS
 from app.core.jev_client import JevClient
 from app.core.model_config import DEFAULT_CONFIG_PATH, load_model_config
 from app.core.policy import RoutingConfig
@@ -276,3 +277,57 @@ def test_validation_error_does_not_echo_the_jev_key(monkeypatch):
         Settings()
 
     assert JEV_CANARY_KEY not in str(excinfo.value)
+
+
+# --- S2.9: the Jev timeout must leave room for a model call ---------------------------------
+# Rule (approved plan): jev_timeout_seconds + MIN_CALL_SECONDS + CALL_MARGIN_SECONDS < request_budget_seconds
+
+CALL_START_SECONDS = MIN_CALL_SECONDS + CALL_MARGIN_SECONDS
+JEV_TIMEOUT = 46.25  # Distinctive values, so a leaked value would be visible in the message
+BOUNDARY_BUDGET = JEV_TIMEOUT + CALL_START_SECONDS  # 50.25: equal, so rejected (strict <)
+
+
+def test_default_timeouts_leave_room_for_a_model_call():
+    settings = Settings()
+
+    assert settings.jev_timeout_seconds + CALL_START_SECONDS < settings.request_budget_seconds
+
+
+@pytest.mark.parametrize(
+    ("jev_timeout", "budget"),
+    [(8.0, 50.0), (JEV_TIMEOUT, BOUNDARY_BUDGET + 0.01), (5.5, 12.5), (6.5, 40.0)],
+    ids=["defaults", "just-above", "env-override-test", "cli-deps-test"],
+)
+def test_timeouts_with_room_for_a_call_are_accepted(jev_timeout, budget):
+    settings = Settings(jev_timeout_seconds=jev_timeout, request_budget_seconds=budget)
+
+    assert (settings.jev_timeout_seconds, settings.request_budget_seconds) == (jev_timeout, budget)
+
+
+@pytest.mark.parametrize(
+    ("jev_timeout", "budget"),
+    [(JEV_TIMEOUT, BOUNDARY_BUDGET), (JEV_TIMEOUT, BOUNDARY_BUDGET - 0.01), (JEV_TIMEOUT, 47.75), (55.5, 50.25)],
+    ids=["exact-boundary", "just-below", "far-below", "jev-longer-than-budget"],
+)
+def test_timeouts_without_room_for_a_call_are_rejected_naming_both_fields_without_values(jev_timeout, budget):
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(jev_timeout_seconds=jev_timeout, request_budget_seconds=budget)
+
+    message = str(excinfo.value)
+    assert "jev_timeout_seconds" in message
+    assert "request_budget_seconds" in message
+    for value in (jev_timeout, budget):
+        assert repr(value) not in message
+        assert str(value) not in message
+    assert "input_value" not in message
+
+
+def test_timeouts_from_the_environment_are_cross_checked(monkeypatch):
+    monkeypatch.setenv("JEV_TIMEOUT_SECONDS", str(JEV_TIMEOUT))
+    monkeypatch.setenv("REQUEST_BUDGET_SECONDS", str(BOUNDARY_BUDGET))
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    assert "jev_timeout_seconds" in str(excinfo.value)
+    assert str(JEV_TIMEOUT) not in str(excinfo.value)

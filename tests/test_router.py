@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from app.core.classifier import get_default_questions
+from app.core.executor import CALL_MARGIN_SECONDS, MIN_CALL_SECONDS
 from app.core.jev_client import (
     JevAuthError,
     JevClient,
@@ -34,6 +35,7 @@ from app.core.model_config import DEFAULT_CONFIG_PATH, load_model_config
 from app.core.policy import RoutingConfig, RoutingConfigError
 from app.core.router import GATEWAY_KEY_ENV, RouteOutcome, RouterDeps, build_cli_deps, main, route
 from app.core.settings import Settings
+from app.db.repo import outcome_to_rows
 from app.infra.budget import RedisStrongBudget, UnavailableStrongBudget
 from tests.fakes import FakeClock, FakeLLM, RecordingSleep
 
@@ -910,3 +912,121 @@ def test_cli_summary_reports_reasoning_and_malformed_usage_tokens(capsys):
         ("malformed", 9, 64, None),
         ("success", ok(CHEAP[1]).input_tokens, ok(CHEAP[1]).output_tokens, 3),
     ]
+
+
+# --- S2.9: no strong reservation when no model call can start (D14: keep the decision) ------
+
+CALL_START_SECONDS = MIN_CALL_SECONDS + CALL_MARGIN_SECONDS  # The executor's minimum remaining time
+
+
+@pytest.mark.parametrize(
+    ("jev_outcome", "reason"),
+    [(HARD_JEV, "HARD"), (LOW_CONFIDENCE_JEV, "LOW_CONFIDENCE"), (JevTimeoutError("timed out"), "JEV_ERROR")],
+    ids=["hard", "low-confidence", "jev-error"],
+)
+def test_strong_route_does_not_reserve_when_no_model_call_can_start(jev_outcome, reason):
+    # The plan's case: Jev takes 48.5 s of the 50 s budget, leaving 1.5 s (< 4 s needed to start a call).
+    harness = Harness(jev_outcome, [ok(STRONG[0])], jev_seconds=48.5)
+
+    outcome = harness.run()
+
+    assert (outcome.decision.tier, outcome.decision.reason) == ("strong", reason)  # Kept, not recomputed (D14)
+    assert outcome.strong_reserved is False
+    assert harness.budget.reserve_calls == 0
+    assert harness.budget.available_calls == 1  # Unchanged: availability is still read once to decide
+    assert len(harness.jev.calls) == 1
+    assert harness.llm.calls == []
+    assert harness.sleep.delays == []
+    assert (outcome.status, outcome.failure_reason, outcome.execution) == ("failed", "deadline", None)
+    assert [(a.tier, a.model, a.status) for a in outcome.attempts] == [
+        ("strong", outcome.decision.model_chain[0], "deadline")
+    ]
+    # The harness's request ID is not a UUID; the mapping requires one.
+    rows = outcome_to_rows(dataclasses.replace(outcome, request_id=str(uuid.uuid4())), prompt=PROMPT)
+    assert {key: rows.request[key] for key in ("status", "failure_reason", "strong_reserved", "tier", "reason")} == {
+        "status": "failed",
+        "failure_reason": "deadline",
+        "strong_reserved": False,
+        "tier": "strong",
+        "reason": reason,
+    }
+
+
+@pytest.mark.parametrize(
+    ("remaining", "can_start"),
+    [(CALL_START_SECONDS - 0.001, False), (CALL_START_SECONDS, True), (CALL_START_SECONDS + 0.001, True)],
+    ids=["just-below", "exactly", "just-above"],
+)
+def test_strong_reservation_boundary_matches_the_executor(remaining, can_start):
+    harness = Harness(HARD_JEV, [ok(STRONG[0])], jev_seconds=50.0 - remaining)
+
+    outcome = harness.run()
+
+    assert harness.budget.reserve_calls == (1 if can_start else 0)
+    assert outcome.strong_reserved is can_start
+    assert harness.llm.models_called == ([STRONG[0]] if can_start else [])  # The executor agrees
+    assert outcome.status == ("success" if can_start else "failed")
+
+
+def test_strong_route_with_time_left_reserves_once_and_runs_as_before():
+    harness = Harness(HARD_JEV, [ok(STRONG[0])], jev_seconds=40.0)  # 10 s left
+
+    outcome = harness.run()
+
+    assert (outcome.decision.tier, outcome.decision.reason) == ("strong", "HARD")
+    assert (outcome.status, outcome.strong_reserved) == ("success", True)
+    assert harness.budget.reserve_calls == 1
+    assert harness.llm.models_called == [STRONG[0]]
+
+
+def test_no_time_left_does_not_turn_a_reservation_race_into_a_reservation():
+    # Budget lost the race (reserve() would say False) but no call can start anyway: reserve() is not called.
+    harness = Harness(HARD_JEV, [ok(CHEAP[0])], budget=FakeBudget(available=True, reserve=False), jev_seconds=48.5)
+
+    outcome = harness.run()
+
+    assert harness.budget.reserve_calls == 0
+    assert (outcome.decision.tier, outcome.decision.reason, outcome.strong_reserved) == ("strong", "HARD", False)
+    assert outcome.failure_reason == "deadline"
+
+
+def test_cheap_route_without_time_left_still_never_reserves_or_escalates():
+    harness = Harness(EASY_JEV, [ok(CHEAP[0])], jev_seconds=48.5)
+
+    outcome = harness.run()
+
+    assert harness.budget.reserve_calls == 0
+    assert (outcome.decision.tier, outcome.strong_reserved, outcome.failure_reason) == ("cheap", False, "deadline")
+    assert [a.tier for a in outcome.attempts] == ["cheap"]
+
+
+class SlowReserveBudget(FakeBudget):
+    """FakeBudget whose successful reserve() takes `reserve_seconds` of the shared fake clock."""
+
+    def __init__(self, reserve_seconds: float):
+        super().__init__(available=True, reserve=True)
+        self.reserve_seconds = reserve_seconds
+        self.clock: FakeClock | None = None  # Set to the harness clock after construction
+
+    async def reserve(self) -> bool:
+        self.clock.advance(self.reserve_seconds)
+        return await super().reserve()
+
+
+def test_residual_race_a_slow_successful_reservation_can_leave_no_time_for_a_call():
+    # Documents a known, accepted limitation of S2.9: the check runs before reserve(), so time spent inside
+    # a slow reserve() is not covered. 5 s remain at the check (enough), reserve() takes 1.5 s, the
+    # executor then sees 3.5 s (< 4 s) and makes no call. The slot is spent and reported as such.
+    budget = SlowReserveBudget(reserve_seconds=1.5)
+    harness = Harness(HARD_JEV, [ok(STRONG[0])], budget=budget, jev_seconds=50.0 - (CALL_START_SECONDS + 1.0))
+    budget.clock = harness.clock
+
+    outcome = harness.run()
+
+    assert harness.budget.reserve_calls == 1
+    assert harness.llm.calls == []
+    assert harness.sleep.delays == []
+    assert (outcome.decision.tier, outcome.decision.reason) == ("strong", "HARD")
+    assert outcome.strong_reserved is True  # The reservation succeeded, so the outcome must say so
+    assert (outcome.status, outcome.failure_reason, outcome.execution) == ("failed", "deadline", None)
+    assert [(a.tier, a.model, a.status) for a in outcome.attempts] == [("strong", STRONG[0], "deadline")]

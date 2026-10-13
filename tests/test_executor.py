@@ -7,10 +7,12 @@ import pytest
 
 from app.core.deadline import Deadline
 from app.core.executor import (
+    CALL_MARGIN_SECONDS,
     MIN_CALL_SECONDS,
     Attempt,
     ChainExhausted,
     ExecutionResult,
+    can_start_call,
     execute,
 )
 from app.core.llm_client import (
@@ -466,3 +468,53 @@ def test_non_malformed_failures_never_record_tokens():
     attempt = first_attempt([client_error(), ok(CHEAP[1])])
 
     assert (attempt.input_tokens, attempt.output_tokens, attempt.reasoning_tokens) == (None, None, None)
+
+
+# --- S2.9: can_start_call, the executor's own start rule ------------------------------------
+
+CALL_START_SECONDS = MIN_CALL_SECONDS + CALL_MARGIN_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [
+        (CALL_START_SECONDS - 0.001, False),
+        (CALL_START_SECONDS, True),
+        (CALL_START_SECONDS + 0.001, True),
+        (0.5, False),
+        (60.0, True),
+    ],
+    ids=["just-below", "exactly", "just-above", "far-below", "beyond-max-call"],
+)
+def test_can_start_call_needs_the_minimum_call_plus_the_margin(budget, expected):
+    assert can_start_call(Deadline(budget, clock=FakeClock())) is expected
+
+
+def test_can_start_call_follows_the_shared_clock_and_is_false_once_expired():
+    clock = FakeClock()
+    deadline = Deadline(10.0, clock=clock)
+
+    clock.advance(10.0 - CALL_START_SECONDS)
+    assert can_start_call(deadline) is True
+    clock.advance(0.001)
+    assert can_start_call(deadline) is False
+    clock.advance(100.0)
+    assert can_start_call(deadline) is False
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [CALL_START_SECONDS - 0.001, CALL_START_SECONDS, CALL_START_SECONDS + 0.001],
+    ids=["just-below", "exactly", "just-above"],
+)
+@pytest.mark.parametrize("tier", ["cheap", "strong"])
+def test_can_start_call_agrees_with_whether_the_executor_starts_a_call(budget, tier):
+    harness = Harness([ok(STRONG[0] if tier == "strong" else CHEAP[0])], budget=budget)
+    predicted = can_start_call(harness.deadline)
+
+    if predicted:
+        harness.run(make_route(tier))
+    else:
+        assert harness.run_failing(make_route(tier)).reason == "deadline"
+
+    assert (len(harness.llm.calls) == 1) is predicted

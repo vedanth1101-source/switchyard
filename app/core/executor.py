@@ -109,6 +109,16 @@ _Stop = Literal["next_model", "deadline", "fatal"]
 Sleep = Callable[[float], Awaitable[None]]
 
 
+def can_start_call(deadline: Deadline) -> bool:
+    """Whether the deadline still allows a model call to start under the executor's own rule (at least
+    MIN_CALL_SECONDS of call time after keeping CALL_MARGIN_SECONDS free). Says nothing about finishing."""
+    return _call_timeout(deadline) >= MIN_CALL_SECONDS
+
+
+def _call_timeout(deadline: Deadline) -> float:
+    return min(MAX_CALL_SECONDS, deadline.remaining() - CALL_MARGIN_SECONDS)
+
+
 async def execute(
     prompt: str,
     route: RouteDecision,
@@ -162,7 +172,7 @@ async def _run_model(
     max_attempts = config.limits.max_attempts_per_model
     max_tokens = config.catalog[model].max_output_tokens
     for attempt_no in range(1, max_attempts + 1):
-        timeout = min(MAX_CALL_SECONDS, deadline.remaining() - CALL_MARGIN_SECONDS)
+        timeout = _call_timeout(deadline)
         if timeout < MIN_CALL_SECONDS:
             attempts.append(Attempt(tier, model, attempt_no, "deadline", latency_ms=0))
             return "deadline"

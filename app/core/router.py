@@ -36,7 +36,15 @@ from pydantic import ValidationError
 from app.core.classifier import JevDecision, get_default_questions, parse_jev_response
 from app.core.costs import CostError, CostEstimate, estimate_cost
 from app.core.deadline import Deadline
-from app.core.executor import Attempt, ChainExhausted, ExecutionResult, ExhaustionReason, Sleep, execute
+from app.core.executor import (
+    Attempt,
+    ChainExhausted,
+    ExecutionResult,
+    ExhaustionReason,
+    Sleep,
+    can_start_call,
+    execute,
+)
 from app.core.jev_client import JevAuthError, JevClient, JevClientError
 from app.core.llm_client import GatewayClient, LLMAuthError, LLMClient
 from app.core.model_config import ModelConfig, ModelConfigError, load_model_config
@@ -117,7 +125,7 @@ async def route(prompt: str, *, dry_run: bool, deps: RouterDeps) -> RouteOutcome
 
     jev, jev_error, jev_http_status, jev_error_cause = await _classify(prompt, deps.jev)
     try:
-        decision, reserved = await _decide(jev, jev_error, dry_run=dry_run, deps=deps)
+        decision, reserved = await _decide(jev, jev_error, dry_run=dry_run, deps=deps, deadline=deadline)
         status, execution, attempts, failure_reason = await _execute(prompt, decision, dry_run, deps, deadline)
     except RoutingConfigError:
         _log_request(
@@ -199,12 +207,16 @@ async def _classify(
 
 
 async def _decide(
-    jev: Optional[JevDecision], jev_error: Optional[str], *, dry_run: bool, deps: RouterDeps
+    jev: Optional[JevDecision], jev_error: Optional[str], *, dry_run: bool, deps: RouterDeps, deadline: Deadline
 ) -> Tuple[RouteDecision, bool]:
     routing = deps.config.routing
     budget_available = await deps.budget.available()
     decision = decide_route(jev, routing, budget_available=budget_available, jev_error=jev_error)
     if decision.tier != "strong" or dry_run:
+        return decision, False
+    if not can_start_call(deadline):
+        # Jev used the time a model call needs: reserve nothing and keep the decision (D14, S2.9). The
+        # executor then records the deadline failure without calling a model.
         return decision, False
     if await deps.budget.reserve():
         return decision, True
