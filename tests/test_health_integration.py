@@ -28,6 +28,9 @@ def require_real_service_urls(environ: Mapping[str, str]) -> tuple[str, str]:
     SQLite or any other database must not satisfy the PostgreSQL requirement. Failure messages
     name the variable, never its value.
     """
+    # Hide this frame from tracebacks: pytest would otherwise print the `environ` argument, including
+    # both URLs' passwords and every other variable.
+    __tracebackhide__ = True
     database_url = environ.get("DATABASE_URL", "").strip()
     redis_url = environ.get("REDIS_URL", "").strip()
     if not database_url:
