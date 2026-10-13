@@ -41,6 +41,9 @@ TTL_TOLERANCE_SECONDS = 10
 
 def require_local_redis_url(environ: Mapping[str, str]) -> str:
     """Fail unless REDIS_URL is redis:// on a loopback host. Messages never include the URL."""
+    # Hide this frame from tracebacks: pytest would otherwise print the `environ` argument, including
+    # REDIS_URL's password and every other variable.
+    __tracebackhide__ = True
     redis_url = environ.get("REDIS_URL", "").strip()
     if not redis_url:
         pytest.fail("Budget integration test needs a local Redis service; set REDIS_URL")
