@@ -16,17 +16,27 @@ keys. 422 bodies are ValidationErrorResponse (built by app.main), without the su
 `cost` (S1.8) is a list-price estimate for the successful call only (Jev excluded); it is null for
 dry runs and when it cannot be calculated, never zero in that case.
 
+Persistence (S2.5): every outcome route() returns (200, 502 and 503 above) is saved before the
+response is sent, by the recorder from get_outcome_recorder() (tests override it). Setup errors, 422
+and unexpected exceptions have no outcome and are not saved. Persistence fails open: if the database
+fails (SQLAlchemyError) or outcome_to_rows refuses the outcome (OutcomeRowsError), the response is
+unchanged and one warning with the request ID and exception type is logged. Any other exception is a
+bug and reaches the generic 500. Without DATABASE_URL nothing is saved (one INFO line per request).
+
 Not implemented yet: cache (`use_cache` is accepted and ignored; `cache_hit` is omitted), per-IP
 rate limiting / 429 (Sprint 2).
 """
 
 import dataclasses
+import functools
 import logging
-from typing import Any, Literal, Optional, Union
+from typing import Any, Awaitable, Callable, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
 
 from app.core.costs import CostEstimate
 from app.core.executor import Attempt
@@ -36,6 +46,8 @@ from app.core.model_config import ModelConfigError
 from app.core.policy import RoutingConfigError
 from app.core.router import CliConfigurationError, DepsFactory, RouteOutcome, build_cli_deps, route
 from app.core.settings import Settings, get_settings
+from app.db.repo import OutcomeRowsError, outcome_to_rows, save_outcome
+from app.infra.db import get_engine
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -158,6 +170,29 @@ def get_deps_factory() -> DepsFactory:
     return build_cli_deps
 
 
+OutcomeRecorder = Callable[[RouteOutcome, str], Awaitable[None]]
+
+
+def get_outcome_recorder(settings: Settings = Depends(get_settings)) -> OutcomeRecorder:
+    """Real persistence to DATABASE_URL; tests override this."""
+    return functools.partial(record_outcome, database_url=settings.database_url)
+
+
+async def record_outcome(outcome: RouteOutcome, prompt: str, *, database_url: Optional[str]) -> None:
+    """Saves one outcome and its attempts; the blocking database work runs in Starlette's thread pool."""
+    if database_url is None:
+        reason = "database_not_configured"
+        logger.info(
+            "route persistence skipped request_id=%s reason=%s",
+            outcome.request_id,
+            reason,
+            extra={"request_id": outcome.request_id, "reason": reason},
+        )
+        return
+    rows = outcome_to_rows(outcome, prompt=prompt)
+    await run_in_threadpool(save_outcome, get_engine(database_url), rows)
+
+
 @router.post(
     "/route",
     response_model=RouteResponse,
@@ -178,6 +213,7 @@ async def route_prompt(
     response: Response,
     settings: Settings = Depends(get_settings),
     deps_factory: DepsFactory = Depends(get_deps_factory),
+    recorder: OutcomeRecorder = Depends(get_outcome_recorder),
 ) -> Any:
     request_id: str = request.state.request_id
     try:
@@ -191,10 +227,26 @@ async def route_prompt(
     except (ModelConfigError, CliConfigurationError, RoutingConfigError) as exc:
         return _setup_error(500, "configuration_error", exc, request_id)
 
+    await _persist(recorder, outcome, body.prompt)  # The same prompt string route() received
     if outcome.status == "failed":
         return _failure(outcome)
     response.headers[REQUEST_ID_HEADER] = outcome.request_id
     return _success(outcome)
+
+
+async def _persist(recorder: OutcomeRecorder, outcome: RouteOutcome, prompt: str) -> None:
+    try:
+        await recorder(outcome, prompt)
+    except (SQLAlchemyError, OutcomeRowsError) as exc:
+        # Fail open: routing availability over persistence. Type only: SQLAlchemy messages include SQL
+        # (and row values when hide_parameters is off), and mapping messages name refused fields.
+        error_type = type(exc).__name__
+        logger.warning(
+            "route persistence failed request_id=%s error_type=%s",
+            outcome.request_id,
+            error_type,
+            extra={"request_id": outcome.request_id, "error_type": error_type},
+        )
 
 
 def _success(outcome: RouteOutcome) -> RouteResponse:

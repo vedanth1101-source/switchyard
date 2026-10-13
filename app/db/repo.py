@@ -36,6 +36,10 @@ from app.infra.db import TIMEOUT_SECONDS
 _CLASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+class OutcomeRowsError(ValueError):
+    """outcome_to_rows() refused an outcome; a distinct type so callers can tell it from other bugs."""
+
+
 @dataclass(frozen=True)
 class OutcomeRows:
     request: Mapping[str, Any]  # One `requests` row; created_at is set by the database
@@ -45,15 +49,15 @@ class OutcomeRows:
 def outcome_to_rows(outcome: RouteOutcome, *, prompt: str) -> OutcomeRows:
     """
     Raises:
-        ValueError: If request_id is not a UUID, the prompt is empty, or a Jev error field is not an
-            exception class name. Messages never include the offending value.
+        OutcomeRowsError: If request_id is not a UUID, the prompt is empty, or a Jev error field is not
+            an exception class name. Messages never include the offending value.
     """
     try:
         request_id = uuid.UUID(outcome.request_id)
     except (ValueError, AttributeError, TypeError):
-        raise ValueError("request_id must be a UUID") from None
+        raise OutcomeRowsError("request_id must be a UUID") from None
     if not prompt:
-        raise ValueError("prompt must not be empty")
+        raise OutcomeRowsError("prompt must not be empty")
 
     decision, jev, execution, cost = outcome.decision, outcome.jev, outcome.execution, outcome.cost
     request = {
@@ -135,5 +139,5 @@ def _usd(value: float) -> Decimal:
 
 def _class_name(value: Optional[str], field: str) -> Optional[str]:
     if value is not None and not _CLASS_NAME.fullmatch(value):
-        raise ValueError(f"{field} must be an exception class name")
+        raise OutcomeRowsError(f"{field} must be an exception class name")
     return value

@@ -100,7 +100,7 @@ jobs:
         run: >-
           pytest -m integration -rA --junitxml="$RUNNER_TEMP/integration.xml"
           tests/test_health_integration.py tests/test_migrations_integration.py tests/test_budget_integration.py
-          tests/test_db_schema_integration.py tests/test_repo_integration.py
+          tests/test_db_schema_integration.py tests/test_repo_integration.py tests/test_route_persistence_integration.py
       - name: Require the integration tests to have run and passed (not skipped)
         run: |
           python - <<'EOF'
@@ -127,6 +127,9 @@ jobs:
               "test_jev_failure_maps_absent_jev_data_to_sql_null",
               "test_a_rejected_attempt_rolls_back_the_whole_outcome",
               "test_saving_the_same_outcome_twice_fails_and_keeps_exactly_one_copy",
+              "test_routed_request_is_saved_under_its_response_request_id",
+              "test_failed_route_is_saved_with_its_attempts_in_order",
+              "test_unreachable_database_still_returns_the_routing_response",
           }
           root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "integration.xml")).getroot()
           cases = list(root.iter("testcase"))

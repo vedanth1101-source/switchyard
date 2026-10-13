@@ -36,8 +36,31 @@ def test_get_engine_uses_null_pool_pre_ping_and_connect_timeout(monkeypatch):
     assert isinstance(engine.pool, NullPool)
     assert engine.pool._pre_ping is True
     assert calls == [
-        {"poolclass": NullPool, "pool_pre_ping": True, "connect_args": {"connect_timeout": db.TIMEOUT_SECONDS}}
+        {
+            "poolclass": NullPool,
+            "pool_pre_ping": True,
+            "connect_args": {"connect_timeout": db.TIMEOUT_SECONDS},
+            "hide_parameters": True,  # S2.5 (approved D3)
+        }
     ]
+    db.get_engine.cache_clear()
+
+
+def test_get_engine_keeps_sql_parameters_out_of_error_messages():
+    # Defense in depth for S2.5: a rendered SQLAlchemy error never carries the row values.
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    db.get_engine.cache_clear()
+    engine = db.get_engine("sqlite://")
+    assert engine.hide_parameters is True
+
+    with engine.connect() as connection:
+        connection.execute(text("CREATE TABLE t (x TEXT NOT NULL, y INTEGER NOT NULL)"))
+        with pytest.raises(IntegrityError) as error:
+            connection.execute(text("INSERT INTO t (x, y) VALUES (:x, :y)"), {"x": "SECRET-ROW-VALUE", "y": None})
+
+    assert "SECRET-ROW-VALUE" not in str(error.value)
     db.get_engine.cache_clear()
 
 

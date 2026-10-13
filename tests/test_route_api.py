@@ -2,14 +2,17 @@
 
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import pytest
+import sqlalchemy
 from fastapi.testclient import TestClient
 
 from app.core.jev_client import JevAuthError, JevClientError, JevTimeoutError
@@ -25,6 +28,9 @@ from app.core.llm_client import (
 from app.core.model_config import ModelConfigError, load_model_config
 from app.core.policy import RoutingConfig
 from app.core.router import CliConfigurationError, RouterDeps
+from app.core.settings import get_settings
+from app.db.repo import OutcomeRowsError
+from app.infra.db import get_engine
 from app.main import create_app
 from app.routes import route as route_api
 from tests.fakes import FakeBudget, FakeClock, FakeJev, FakeLLM, RecordingSleep
@@ -66,7 +72,7 @@ def client_error() -> LLMClientError:
 
 
 class ApiHarness:
-    def __init__(self, jev_outcome=EASY_JEV, script=(), budget=None, jev_seconds=0.0, config=CONFIG):
+    def __init__(self, jev_outcome=EASY_JEV, script=(), budget=None, jev_seconds=0.0, config=CONFIG, recorder=None):
         self.clock = FakeClock()
         self.jev = FakeJev(jev_outcome, self.clock, jev_seconds)
         self.budget = budget or FakeBudget()
@@ -84,6 +90,8 @@ class ApiHarness:
         self.factory_calls: list[bool] = []
         app = create_app()
         app.dependency_overrides[route_api.get_deps_factory] = lambda: self.factory
+        if recorder is not None:  # Otherwise the real recorder (a no-op without DATABASE_URL)
+            app.dependency_overrides[route_api.get_outcome_recorder] = lambda: recorder
         self.client = TestClient(app)
 
     @asynccontextmanager
@@ -95,7 +103,7 @@ class ApiHarness:
         return self.client.post("/api/route", json=body)
 
 
-def client_with_failing_factory(error: Exception) -> TestClient:
+def client_with_failing_factory(error: Exception, recorder=None) -> TestClient:
     @asynccontextmanager
     async def factory(settings, *, dry_run):
         raise error
@@ -103,6 +111,8 @@ def client_with_failing_factory(error: Exception) -> TestClient:
 
     app = create_app()
     app.dependency_overrides[route_api.get_deps_factory] = lambda: factory
+    if recorder is not None:
+        app.dependency_overrides[route_api.get_outcome_recorder] = lambda: recorder
     return TestClient(app)
 
 
@@ -680,3 +690,200 @@ def test_502_malformed_attempts_carry_usage_tokens():
         ("malformed", 9, 64, None),
         ("client_error", None, None, None),
     ]
+
+
+# --- S2.5: every outcome route() returns is persisted; persistence fails open -----------------
+
+
+class FakeRecorder:
+    """Replaces get_outcome_recorder(): records each call and optionally raises."""
+
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        self.calls: list[tuple] = []
+
+    async def __call__(self, outcome, prompt):
+        self.calls.append((outcome, prompt))
+        if self.error is not None:
+            raise self.error
+
+
+SQL_SECRET = "SECRET-SQL-PARAM"
+
+
+def sql_error(kind):
+    # SQLAlchemy renders the statement and its parameters into str(exc) (unless hide_parameters).
+    return kind(
+        f"INSERT INTO requests (prompt_hash) VALUES (%(p)s) -- {SQL_SECRET}",
+        {"p": SQL_SECRET, "prompt": PROMPT},
+        Exception(f"connection to postgresql://user:{SQL_SECRET}@db failed"),
+    )
+
+
+RECORDED_CASES = {
+    "success": (EASY_JEV, [ok(CHEAP[0])], {}, 0.0, 200, "success", None),
+    "dry-run": (EASY_JEV, [], {"dry_run": True}, 0.0, 200, "dry_run", None),
+    "all-failed": (EASY_JEV, [client_error(), client_error()], {}, 0.0, 502, "failed", "all_failed"),
+    "deadline": (EASY_JEV, [ok(CHEAP[0])], {}, 50.0, 502, "failed", "deadline"),
+    "fatal": (HARD_JEV, [LLMAuthError("m: HTTP 401", status_code=401)], {}, 0.0, 503, "failed", "fatal"),
+}
+
+
+@pytest.mark.parametrize("case", RECORDED_CASES, ids=list(RECORDED_CASES))
+def test_every_returned_outcome_is_recorded_once_with_the_routed_prompt(case):
+    jev, script, extra, jev_seconds, status, outcome_status, failure_reason = RECORDED_CASES[case]
+    recorder = FakeRecorder()
+    harness = ApiHarness(jev, script, jev_seconds=jev_seconds, recorder=recorder)
+
+    response = harness.post({"prompt": PROMPT, **extra})
+
+    assert response.status_code == status
+    ((outcome, prompt),) = recorder.calls
+    assert (outcome.status, outcome.failure_reason) == (outcome_status, failure_reason)
+    assert outcome.request_id == assert_request_id_header(response)
+    assert prompt == PROMPT == harness.jev.calls[0][0]  # The exact string that was routed
+
+
+def broken_routing_config():
+    return dataclasses.replace(CONFIG, routing=RoutingConfig(models={}, general_strong_chain=list(STRONG)))
+
+
+def post_with_failing_factory(error, recorder):
+    return client_with_failing_factory(error, recorder).post("/api/route", json={"prompt": PROMPT})
+
+
+@pytest.mark.parametrize(
+    "send",
+    [
+        lambda recorder: ApiHarness(recorder=recorder).post({"prompt": ""}),
+        lambda recorder: post_with_failing_factory(JevAuthError("missing"), recorder),
+        lambda recorder: post_with_failing_factory(LLMAuthError("missing"), recorder),
+        lambda recorder: post_with_failing_factory(ModelConfigError("bad"), recorder),
+        lambda recorder: ApiHarness(EASY_JEV, config=broken_routing_config(), recorder=recorder).post(
+            {"prompt": PROMPT}
+        ),
+    ],
+    ids=["422", "jev-not-configured", "gateway-not-configured", "config-error", "routing-config-error"],
+)
+def test_requests_without_a_returned_outcome_are_not_recorded(send):
+    recorder = FakeRecorder()
+
+    response = send(recorder)
+
+    assert response.status_code in (422, 500, 503)
+    assert recorder.calls == []
+
+
+def response_without_request_id(response: httpx.Response) -> tuple:
+    body = response.json()
+    assert body.pop("request_id") == response.headers["X-Request-ID"]
+    return response.status_code, body
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        sql_error(sqlalchemy.exc.OperationalError),
+        sql_error(sqlalchemy.exc.IntegrityError),
+        OutcomeRowsError("jev_error must be an exception class name"),
+    ],
+    ids=["operational", "integrity", "mapping-refused"],
+)
+@pytest.mark.parametrize(
+    "script", [[ok(CHEAP[0])], [client_error(), client_error()]], ids=["200-success", "502-all-failed"]
+)
+def test_persistence_failure_returns_the_unchanged_response_and_logs_only_the_type(caplog, error, script):
+    baseline = ApiHarness(EASY_JEV, script, recorder=FakeRecorder()).post({"prompt": PROMPT})
+    recorder = FakeRecorder(error)
+
+    with caplog.at_level(logging.INFO):
+        response = ApiHarness(EASY_JEV, script, recorder=recorder).post({"prompt": PROMPT})
+
+    assert len(recorder.calls) == 1
+    assert response_without_request_id(response) == response_without_request_id(baseline)  # Fail open
+    failures = [r for r in caplog.records if r.getMessage().startswith("route persistence failed")]
+    assert [(r.levelno, r.request_id, r.error_type) for r in failures] == [
+        (logging.WARNING, response.headers["X-Request-ID"], type(error).__name__)
+    ]
+    assert failures[0].exc_info is None
+    for leaked in (SQL_SECRET, "INSERT INTO", "PROMPT-MARKER", "jev_error must", "Traceback"):
+        assert leaked not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ValueError(f"plain bug {SQL_SECRET}"), RuntimeError("bug"), KeyError("bug")],
+    ids=["value", "runtime", "key"],
+)
+def test_unexpected_recorder_errors_are_not_treated_as_persistence_failures(caplog, error):
+    recorder = FakeRecorder(error)
+
+    with caplog.at_level(logging.INFO):
+        response = ApiHarness(EASY_JEV, [ok(CHEAP[0])], recorder=recorder).post({"prompt": PROMPT})
+
+    assert response.status_code == 500
+    assert response.json() == {"request_id": response.headers["X-Request-ID"], "error": "internal_error"}
+    assert "route persistence failed" not in caplog.text
+    assert SQL_SECRET not in caplog.text
+
+
+# --- S2.5: the real recorder ----------------------------------------------------------------
+
+
+def test_real_recorder_without_a_database_skips_with_one_info_log(caplog, monkeypatch):
+    def no_engine(url):
+        raise AssertionError("no database work without DATABASE_URL")
+
+    monkeypatch.setattr(route_api, "get_engine", no_engine)
+
+    with caplog.at_level(logging.INFO, logger="app.routes.route"):
+        response = ApiHarness(EASY_JEV, [ok(CHEAP[0])]).post({"prompt": PROMPT})
+
+    assert response.status_code == 200
+    skipped = [r for r in caplog.records if r.name == "app.routes.route"]
+    assert [(r.levelno, r.request_id, r.reason) for r in skipped] == [
+        (logging.INFO, response.headers["X-Request-ID"], "database_not_configured")
+    ]
+
+
+def test_real_recorder_saves_the_mapped_rows_through_the_cached_engine_off_the_event_loop(monkeypatch):
+    database_url = "postgresql+psycopg://user@localhost:5432/switchyard"  # The engine is built, never connected
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    seen = {}
+    real_outcome_to_rows = route_api.outcome_to_rows
+
+    def mapping_on_the_loop(outcome, *, prompt):
+        seen["mapping_thread"] = threading.get_ident()
+        return real_outcome_to_rows(outcome, prompt=prompt)
+
+    def capture_save(engine, rows):
+        seen.update(engine=engine, rows=rows, save_thread=threading.get_ident())
+
+    monkeypatch.setattr(route_api, "outcome_to_rows", mapping_on_the_loop)
+    monkeypatch.setattr(route_api, "save_outcome", capture_save)
+
+    response = ApiHarness(EASY_JEV, [ok(CHEAP[0])]).post({"prompt": PROMPT})
+
+    assert response.status_code == 200
+    assert seen["engine"] is get_engine(database_url)  # The shared, cached engine
+    assert seen["rows"].request["id"] == uuid.UUID(response.headers["X-Request-ID"])
+    assert seen["rows"].request["prompt_hash"] == hashlib.sha256(PROMPT.encode("utf-8")).hexdigest()
+    assert seen["save_thread"] != seen["mapping_thread"]  # save_outcome ran in Starlette's thread pool
+    get_engine.cache_clear()
+
+
+def test_real_recorder_with_an_unusable_database_url_fails_open(caplog, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"not-a-database-url-{SQL_SECRET}")
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+
+    with caplog.at_level(logging.INFO):
+        response = ApiHarness(EASY_JEV, [ok(CHEAP[0])]).post({"prompt": PROMPT})
+
+    assert response.status_code == 200
+    failures = [r for r in caplog.records if r.getMessage().startswith("route persistence failed")]
+    assert [r.error_type for r in failures] == ["ArgumentError"]
+    assert SQL_SECRET not in caplog.text
+    get_engine.cache_clear()
