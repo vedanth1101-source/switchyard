@@ -8,6 +8,9 @@ per request (an inbound X-Request-ID is ignored), stores it in request.state.req
 and catches unhandled exceptions itself: Starlette's ServerErrorMiddleware re-raises them, and the
 server would then log the full traceback and message. Logs carry the exception type and frame
 locations only. 422 bodies drop FastAPI's `input` and `ctx`, which can echo the submitted prompt.
+
+create_app() configures JSON-lines logging (app.infra.logging, S2.10). The middleware also sets
+app.infra.logging.REQUEST_ID while the request runs, so every log line it causes carries the request ID.
 """
 
 import logging
@@ -22,6 +25,7 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.infra.logging import REQUEST_ID, configure_logging
 from app.routes import health
 from app.routes import route as route_api
 from app.routes.route import REQUEST_ID_HEADER, InternalErrorResponse, ValidationErrorItem, ValidationErrorResponse
@@ -33,6 +37,7 @@ FRONTEND_DIR = "web/dist"
 
 
 def create_app(frontend_dir: str | PathLike[str] = FRONTEND_DIR) -> FastAPI:
+    configure_logging()
     application = FastAPI(
         title="Switchyard",
         docs_url="/api/docs",
@@ -75,6 +80,13 @@ class RequestIdMiddleware:
             return
         request_id = str(uuid.uuid4())
         scope.setdefault("state", {})["request_id"] = request_id
+        token = REQUEST_ID.set(request_id)  # Log lines caused by this request carry its ID
+        try:
+            await self._handle(scope, receive, send, request_id)
+        finally:
+            REQUEST_ID.reset(token)
+
+    async def _handle(self, scope: Scope, receive: Receive, send: Send, request_id: str) -> None:
         response_started = False
 
         async def send_with_request_id(message: Message) -> None:
