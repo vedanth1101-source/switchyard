@@ -8,7 +8,8 @@ written when route() raises: setup errors, RoutingConfigError and unexpected exc
 
 Stored: a sha256 of the prompt and its length, never the prompt or the answer; exception class names
 and HTTP statuses, never messages; no client IP. Costs are list-price estimates in USD; NULL means
-unknown, never zero. Jev credits are a count, never converted to USD.
+unknown, never zero. Jev credits are a count, never converted to USD. JSONB columns use
+none_as_null=True, so Python None is stored as SQL NULL, not as the JSON value `null`.
 
 CHECK constraints pin the closed value sets the routing code defines (tests/test_db_models.py keeps
 them equal to the code's Literal types); a new value needs a migration. task_type is not constrained:
@@ -103,12 +104,12 @@ class RequestRecord(SQLModel, table=True):
     task_type: str = Field(sa_column=sa.Column(sa.Text, nullable=False))
     tier: str = Field(sa_column=sa.Column(sa.Text, nullable=False))
     reason: str = Field(sa_column=sa.Column(sa.Text, nullable=False))
-    model_chain: list[str] = Field(sa_column=sa.Column(JSONB, nullable=False))
+    model_chain: list[str] = Field(sa_column=sa.Column(JSONB(none_as_null=True), nullable=False))
     confidence: Optional[float] = Field(default=None, sa_column=sa.Column(sa.Double))  # NULL when Jev failed
     difficulty: Optional[float] = Field(default=None, sa_column=sa.Column(sa.Double))
     needs_reasoning_prob: Optional[float] = Field(default=None, sa_column=sa.Column(sa.Double))
-    task_type_probs: Optional[dict[str, Any]] = Field(default=None, sa_column=sa.Column(JSONB))
-    difficulty_dist: Optional[dict[str, Any]] = Field(default=None, sa_column=sa.Column(JSONB))
+    task_type_probs: Optional[dict[str, Any]] = Field(default=None, sa_column=sa.Column(JSONB(none_as_null=True)))
+    difficulty_dist: Optional[dict[str, Any]] = Field(default=None, sa_column=sa.Column(JSONB(none_as_null=True)))
 
     # Jev call
     jev_model: Optional[str] = Field(default=None, sa_column=sa.Column(sa.Text))

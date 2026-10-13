@@ -5,6 +5,7 @@ from typing import get_args
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import psycopg
 from sqlalchemy.schema import CreateTable
 from sqlmodel import SQLModel
 
@@ -108,6 +109,25 @@ def test_exact_type_parameters():
     assert request_columns["prompt_hash"].type.length == 64
     for column in (request_columns["est_cost_usd"], request_columns["baseline_cost_usd"], call_columns["est_cost_usd"]):
         assert (column.type.precision, column.type.scale) == (12, 8)
+
+
+JSONB_COLUMNS = ("model_chain", "task_type_probs", "difficulty_dist")
+
+
+def test_jsonb_columns_store_python_none_as_sql_null():
+    # SQLAlchemy's default (none_as_null=False) writes None as the JSON value `null`, which satisfies
+    # NOT NULL and is not found by IS NULL (CI run 38345880897).
+    for name in JSONB_COLUMNS:
+        assert columns(REQUESTS)[name].type.none_as_null is True, name
+
+
+def test_jsonb_none_reaches_the_driver_as_null_not_as_a_json_value():
+    # The psycopg dialect's bind processor is what turns None into Jsonb(None) (JSON null) by default.
+    dialect = psycopg.dialect()
+    for name in JSONB_COLUMNS:
+        column_type = columns(REQUESTS)[name].type
+        assert column_type.should_evaluate_none is False, name
+        assert column_type.dialect_impl(dialect).bind_processor(dialect)(None) is None, name
 
 
 def test_created_at_defaults_to_the_database_clock():
