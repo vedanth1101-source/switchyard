@@ -58,6 +58,10 @@ def client_error() -> LLMClientError:
     return LLMClientError(f"m: HTTP 400: {SECRET}", status_code=400)
 
 
+def malformed_with_usage() -> LLMMalformedResponseError:
+    return LLMMalformedResponseError(f"m: empty {SECRET}", status_code=200, input_tokens=13, output_tokens=1024)
+
+
 def run_route(jev=EASY_JEV, script=(), *, budget=None, dry_run=False, jev_seconds=0.0, prompt=PROMPT) -> RouteOutcome:
     clock = FakeClock()
     deps = RouterDeps(
@@ -117,9 +121,10 @@ def test_success_maps_outcome_decision_jev_and_cost():
             "input_tokens": 13,
             "output_tokens": 115,
             "reasoning_tokens": 64,
-            "est_cost_usd": None,  # Per-attempt cost is S2.11; never invented here
+            "est_cost_usd": Decimal(str(outcome.attempt_costs[0])),  # S2.11: the same call as the request cost
         }
     ]
+    assert rows.model_calls[0]["est_cost_usd"] == request["est_cost_usd"]
 
 
 def test_dry_run_has_no_calls_no_final_model_and_no_cost():
@@ -289,7 +294,8 @@ def test_malformed_attempt_keeps_its_billed_usage_but_no_reasoning_tokens():
         1024,
         None,
     )
-    assert first["est_cost_usd"] is None
+    assert first["est_cost_usd"] == Decimal(str(outcome.attempt_costs[0]))  # Priced: it reported usage (S2.11)
+    assert first["est_cost_usd"] > 0
 
 
 def test_unknown_success_cost_stays_null_not_zero():
@@ -298,6 +304,68 @@ def test_unknown_success_cost_stays_null_not_zero():
     rows = outcome_to_rows(outcome, prompt=PROMPT)
 
     assert (rows.request["est_cost_usd"], rows.request["baseline_cost_usd"]) == (None, None)
+
+
+# --- Per-attempt cost (S2.11) -----------------------------------------------------------------
+
+
+def test_attempt_costs_map_in_attempt_order_and_unknown_costs_stay_null():
+    outcome = run_route(HARD_JEV, [malformed_with_usage(), client_error(), ok(CHEAP[0])])
+
+    rows = outcome_to_rows(outcome, prompt=PROMPT)
+
+    assert [(c["seq"], c["model"], c["status"]) for c in rows.model_calls] == [
+        (0, STRONG[0], "malformed"),
+        (1, STRONG[1], "client_error"),
+        (2, CHEAP[0], "success"),
+    ]
+    assert [c["est_cost_usd"] for c in rows.model_calls] == [
+        Decimal(str(outcome.attempt_costs[0])),
+        None,
+        Decimal(str(outcome.attempt_costs[2])),
+    ]
+
+
+def test_attempt_costs_are_taken_from_the_outcome_by_position():
+    # The mapping is pure: it copies outcome.attempt_costs by position and never prices anything itself.
+    outcome = run_route(HARD_JEV, [malformed_with_usage(), client_error(), ok(CHEAP[0])])
+    outcome = dataclasses.replace(outcome, attempt_costs=(0.25, None, 0.125))
+
+    rows = outcome_to_rows(outcome, prompt=PROMPT)
+
+    assert [c["est_cost_usd"] for c in rows.model_calls] == [Decimal("0.25"), None, Decimal("0.125")]
+
+
+def test_failed_request_has_no_cost_but_its_priced_attempt_keeps_one():
+    outcome = run_route(EASY_JEV, [malformed_with_usage(), client_error()])
+
+    rows = outcome_to_rows(outcome, prompt=PROMPT)
+
+    assert (rows.request["status"], rows.request["failure_reason"]) == ("failed", "all_failed")
+    assert (rows.request["est_cost_usd"], rows.request["baseline_cost_usd"]) == (None, None)
+    priced, unpriced = rows.model_calls
+    assert priced["est_cost_usd"] == Decimal(str(outcome.attempt_costs[0])) > 0
+    assert unpriced["est_cost_usd"] is None
+
+
+def test_request_cost_is_the_final_call_only_and_never_added_to_attempt_costs():
+    outcome = run_route(HARD_JEV, [malformed_with_usage(), client_error(), ok(CHEAP[0])])
+
+    rows = outcome_to_rows(outcome, prompt=PROMPT)
+
+    success = rows.model_calls[-1]
+    assert success["est_cost_usd"] == rows.request["est_cost_usd"]  # Same call, same estimate
+    attempt_total = sum(c["est_cost_usd"] for c in rows.model_calls if c["est_cost_usd"] is not None)
+    assert attempt_total == rows.model_calls[0]["est_cost_usd"] + success["est_cost_usd"]
+    assert attempt_total > rows.request["est_cost_usd"]  # Earlier priced attempts are spend the request omits
+
+
+def test_deadline_and_dry_run_outcomes_have_no_attempt_cost():
+    deadline = outcome_to_rows(run_route(EASY_JEV, [ok(CHEAP[0])], jev_seconds=50.0), prompt=PROMPT)
+    dry_run = outcome_to_rows(run_route(EASY_JEV, dry_run=True), prompt=PROMPT)
+
+    assert [c["est_cost_usd"] for c in deadline.model_calls] == [None]
+    assert dry_run.model_calls == ()
 
 
 # --- Contract ---------------------------------------------------------------------------------
@@ -313,6 +381,7 @@ def all_outcomes() -> list[RouteOutcome]:
         run_route(EASY_JEV, [client_error(), client_error()]),
         run_route(EASY_JEV, [ok(CHEAP[0])], jev_seconds=50.0),
         run_route(EASY_JEV, [LLMAuthError("m", status_code=401)]),
+        run_route(EASY_JEV, [malformed_with_usage(), client_error()]),  # Failed, with one priced attempt
     ]
 
 
@@ -341,6 +410,9 @@ def test_rows_use_only_values_the_schema_accepts():
             assert call["status"] in models.ATTEMPT_STATUSES
             assert call["tier"] in models.TIERS
             assert call["attempt_no"] >= 1 and call["latency_ms"] >= 0
+            assert call["est_cost_usd"] is None or call["est_cost_usd"] >= 0
+            has_usage = call["input_tokens"] is not None and call["output_tokens"] is not None
+            assert (call["est_cost_usd"] is not None) == has_usage  # Unknown stays NULL, never 0
 
 
 def test_no_row_holds_the_prompt_the_answer_or_an_exception_message():

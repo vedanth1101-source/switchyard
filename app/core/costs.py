@@ -2,9 +2,10 @@
 Cost, baseline and savings estimates for one model call (Task S1.8, FR-9).
 
 All values are list-price estimates in USD from the catalog in config/models.yaml (prices per million
-tokens). They cover the model call that produced the answer only: Jev is excluded because it is paid
-in separate credits, and failed or timed-out attempts report no token usage. The baseline prices the
-same token counts at the configured baseline (always-strong) model.
+tokens). Each estimate covers one model call: the router prices the call that produced the answer and,
+for model_calls (S2.11), every attempt that reported token usage (a malformed 200 can). Other failed or
+timed-out attempts report no usage and stay unpriced. Jev is excluded because it is paid in separate
+credits. The baseline prices the same token counts at the configured baseline (always-strong) model.
 
 Savings are signed (baseline - actual): a model pricier than the baseline gives negative savings.
 A cost that cannot be calculated raises CostError; it is never reported as zero.

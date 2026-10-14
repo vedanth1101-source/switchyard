@@ -149,4 +149,4 @@ class ModelCallRecord(SQLModel, table=True):
     input_tokens: Optional[int] = Field(default=None, sa_column=sa.Column(sa.Integer))
     output_tokens: Optional[int] = Field(default=None, sa_column=sa.Column(sa.Integer))
     reasoning_tokens: Optional[int] = Field(default=None, sa_column=sa.Column(sa.Integer))
-    est_cost_usd: Optional[Decimal] = Field(default=None, sa_column=sa.Column(USD))  # Filled from S2.11
+    est_cost_usd: Optional[Decimal] = Field(default=None, sa_column=sa.Column(USD))  # NULL: usage unknown (S2.11)

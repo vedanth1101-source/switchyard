@@ -8,7 +8,8 @@ RoutingConfigError, unexpected exceptions) have no rows.
 
 Privacy: the prompt is reduced to its sha256 and length; no answer text is mapped; Jev error fields
 must be exception class names (anything else is refused, never stored). Values that are unknown stay
-None (SQL NULL): costs are never invented, and per-attempt cost is left for S2.11.
+None (SQL NULL): costs are never invented. Per-attempt costs (S2.11) are copied from
+RouteOutcome.attempt_costs by position; the router prices them, this module never does.
 
 save_outcome() writes the rows in one transaction: all of them or none. A repeated save of the same
 request_id fails on the primary key (IntegrityError) instead of duplicating rows. Errors propagate to
@@ -92,7 +93,10 @@ def outcome_to_rows(outcome: RouteOutcome, *, prompt: str) -> OutcomeRows:
         "jev_http_status": outcome.jev_http_status,
         "jev_error_cause": _class_name(outcome.jev_error_cause, "jev_error_cause"),
     }
-    model_calls = tuple(_model_call(request_id, seq, attempt) for seq, attempt in enumerate(outcome.attempts))
+    model_calls = tuple(
+        _model_call(request_id, seq, attempt, cost)
+        for seq, (attempt, cost) in enumerate(zip(outcome.attempts, outcome.attempt_costs, strict=True))
+    )
     return OutcomeRows(request=MappingProxyType(request), model_calls=model_calls)
 
 
@@ -113,7 +117,7 @@ def save_outcome(engine: Engine, rows: OutcomeRows) -> None:
             connection.execute(ModelCallRecord.__table__.insert(), [dict(call) for call in rows.model_calls])
 
 
-def _model_call(request_id: uuid.UUID, seq: int, attempt: Attempt) -> Mapping[str, Any]:
+def _model_call(request_id: uuid.UUID, seq: int, attempt: Attempt, cost: Optional[float]) -> Mapping[str, Any]:
     return MappingProxyType(
         {
             "request_id": request_id,
@@ -127,7 +131,7 @@ def _model_call(request_id: uuid.UUID, seq: int, attempt: Attempt) -> Mapping[st
             "input_tokens": attempt.input_tokens,
             "output_tokens": attempt.output_tokens,
             "reasoning_tokens": attempt.reasoning_tokens,
-            "est_cost_usd": None,  # S2.11
+            "est_cost_usd": _usd(cost) if cost is not None else None,
         }
     )
 

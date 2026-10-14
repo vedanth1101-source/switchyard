@@ -27,6 +27,7 @@ from app.core.llm_client import (
     LLMAuthError,
     LLMClientError,
     LLMMalformedResponseError,
+    LLMRateLimitError,
     LLMServerError,
     LLMTimeoutError,
     ModelResult,
@@ -1030,3 +1031,187 @@ def test_residual_race_a_slow_successful_reservation_can_leave_no_time_for_a_cal
     assert outcome.strong_reserved is True  # The reservation succeeded, so the outcome must say so
     assert (outcome.status, outcome.failure_reason, outcome.execution) == ("failed", "deadline", None)
     assert [(a.tier, a.model, a.status) for a in outcome.attempts] == [("strong", STRONG[0], "deadline")]
+
+
+# --- S2.11: per-attempt cost estimates ------------------------------------------------------
+
+
+def catalog_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """List price straight from the catalog, independent of estimate_cost."""
+    entry = CONFIG.catalog[model]
+    return (input_tokens * entry.input_price + output_tokens * entry.output_price) / 1_000_000
+
+
+def malformed_with_usage(input_tokens: int, output_tokens: int) -> LLMMalformedResponseError:
+    return LLMMalformedResponseError(
+        "m: malformed response", status_code=200, input_tokens=input_tokens, output_tokens=output_tokens
+    )
+
+
+def test_successful_attempt_cost_equals_the_request_cost_for_the_same_call():
+    outcome = Harness(EASY_JEV, [ok(CHEAP[0])]).run()
+
+    (cost,) = outcome.attempt_costs
+    assert cost == outcome.cost.est_cost_usd
+    assert cost == pytest.approx(catalog_cost(CHEAP[0], 5, 7))
+
+
+def test_malformed_attempt_with_usage_is_priced_even_when_the_request_fails():
+    outcome = Harness(EASY_JEV, [malformed_with_usage(9, 64), client_error()]).run()
+
+    assert (outcome.status, outcome.failure_reason, outcome.cost) == ("failed", "all_failed", None)
+    assert [a.status for a in outcome.attempts] == ["malformed", "client_error"]
+    assert outcome.attempt_costs[0] == pytest.approx(catalog_cost(CHEAP[0], 9, 64))
+    assert outcome.attempt_costs[1] is None
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (LLMTimeoutError("m: request timed out"), "timeout"),
+        (LLMServerError("m: network error (ConnectError)"), "server_error"),
+        (LLMServerError("m: HTTP 500: server error", status_code=500), "server_error"),
+        (client_error(), "client_error"),
+        (LLMRateLimitError("m: HTTP 429", status_code=429), "rate_limited"),
+        (LLMAuthError("m: HTTP 401", status_code=401), "auth_error"),
+    ],
+    ids=["timeout", "network", "5xx", "4xx", "429", "auth"],
+)
+def test_attempts_without_reported_usage_have_no_cost_not_zero(error, status):
+    outcome = Harness(EASY_JEV, [error, ok(CHEAP[0]), ok(CHEAP[1])]).run()
+
+    assert outcome.attempts[0].status == status
+    assert outcome.attempt_costs[0] is None
+    for attempt, cost in zip(outcome.attempts, outcome.attempt_costs, strict=True):
+        assert (cost is None) == (attempt.status != "success")
+
+
+def test_deadline_entry_has_no_cost():
+    outcome = Harness(EASY_JEV, [ok(CHEAP[0])], jev_seconds=50.0).run()
+
+    assert [a.status for a in outcome.attempts] == ["deadline"]
+    assert outcome.attempt_costs == (None,)
+
+
+def test_dry_run_has_no_attempt_costs():
+    assert Harness(HARD_JEV).run(dry_run=True).attempt_costs == ()
+
+
+def test_fallback_prices_each_attempt_at_its_own_model():
+    harness = Harness(HARD_JEV, [malformed_with_usage(11, 300), client_error(), ok(CHEAP[0])])
+
+    outcome = harness.run()
+
+    assert [(a.model, a.status) for a in outcome.attempts] == [
+        (STRONG[0], "malformed"),
+        (STRONG[1], "client_error"),
+        (CHEAP[0], "success"),
+    ]
+    strong_cost, missing, cheap_cost = outcome.attempt_costs
+    assert strong_cost == pytest.approx(catalog_cost(STRONG[0], 11, 300))
+    assert strong_cost != pytest.approx(catalog_cost(CHEAP[0], 11, 300))
+    assert missing is None
+    assert cheap_cost == pytest.approx(catalog_cost(CHEAP[0], 5, 7))
+    assert cheap_cost == outcome.cost.est_cost_usd  # The request cost is the final call only
+
+
+def test_retries_are_priced_per_attempt():
+    rate_limited = LLMRateLimitError("m: HTTP 429", status_code=429)
+    outcome = Harness(EASY_JEV, [rate_limited, ok(CHEAP[0])]).run()
+
+    assert [(a.model, a.attempt_no) for a in outcome.attempts] == [(CHEAP[0], 1), (CHEAP[0], 2)]
+    assert outcome.attempt_costs == (None, outcome.cost.est_cost_usd)
+
+
+def test_attempt_cost_error_records_none_and_one_sanitized_warning(monkeypatch, caplog):
+    from app.core.costs import CostError
+
+    def failing_estimate(config, model, input_tokens, output_tokens):
+        raise CostError(f"cannot price {model} {input_tokens} {output_tokens} {PROMPT} {FAKE_KEY}")
+
+    monkeypatch.setattr("app.core.router.estimate_cost", failing_estimate)
+    harness = Harness(EASY_JEV, [malformed_with_usage(9, 64), client_error()])
+
+    with caplog.at_level(logging.DEBUG):
+        outcome = harness.run()
+
+    assert outcome.attempt_costs == (None, None)
+    (warning,) = [r for r in caplog.records if r.getMessage().startswith("attempt cost unavailable")]
+    assert warning.levelno == logging.WARNING
+    assert warning.getMessage() == "attempt cost unavailable request_id=req-1 attempt=0 error_type=CostError"
+    assert (warning.request_id, warning.error_type) == ("req-1", "CostError")
+    assert not {"model", "input_tokens", "output_tokens", "price"} & vars(warning).keys()
+    for forbidden in (CHEAP[0], PROMPT, "PROMPT-MARKER", FAKE_KEY, "cannot price", "0.05"):
+        assert forbidden not in caplog.text
+
+
+def test_attempt_costs_stay_aligned_with_attempts():
+    scripts = [
+        (EASY_JEV, [ok(CHEAP[0])], 0.0),
+        (EASY_JEV, [client_error(), client_error()], 0.0),
+        (HARD_JEV, [malformed_with_usage(3, 0), client_error(), ok(CHEAP[0])], 0.0),
+        (EASY_JEV, [LLMAuthError("m", status_code=401)], 0.0),
+        (EASY_JEV, [ok(CHEAP[0])], 50.0),
+    ]
+    for jev, script, jev_seconds in scripts:
+        outcome = Harness(jev, script, jev_seconds=jev_seconds).run()
+        assert len(outcome.attempt_costs) == len(outcome.attempts)
+        for attempt, cost in zip(outcome.attempts, outcome.attempt_costs, strict=True):
+            has_usage = attempt.input_tokens is not None and attempt.output_tokens is not None
+            assert (cost is not None) == has_usage
+            assert cost is None or cost >= 0
+
+
+def test_malformed_attempt_with_zero_output_tokens_is_priced_for_its_input():
+    outcome = Harness(EASY_JEV, [malformed_with_usage(3, 0), ok(CHEAP[1])]).run()
+
+    assert outcome.attempt_costs[0] == pytest.approx(catalog_cost(CHEAP[0], 3, 0))
+    assert outcome.attempt_costs[0] > 0
+
+
+def test_route_outcome_refuses_attempt_costs_not_aligned_with_attempts():
+    outcome = Harness(EASY_JEV, [ok(CHEAP[0])]).run()
+
+    with pytest.raises(ValueError, match="attempt_costs"):
+        dataclasses.replace(outcome, attempt_costs=())
+
+
+def cost_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "cost unavailable" in r.getMessage()
+    ]
+
+
+def test_cost_error_on_the_successful_call_is_logged_once(monkeypatch, caplog):
+    # The request cost and the success attempt's cost are the same call: one failure, one warning.
+    from app.core.costs import CostError
+
+    def failing_estimate(*args):
+        raise CostError("cannot price")
+
+    monkeypatch.setattr("app.core.router.estimate_cost", failing_estimate)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.router"):
+        outcome = Harness(EASY_JEV, [ok(CHEAP[0])]).run()
+
+    assert (outcome.status, outcome.cost, outcome.attempt_costs) == ("success", None, (None,))
+    assert cost_warnings(caplog) == ["route cost unavailable request_id=req-1 error_type=CostError"]
+
+
+def test_cost_errors_on_distinct_attempts_are_each_logged(monkeypatch, caplog):
+    # An earlier priced attempt is a different call from the final one, so it keeps its own warning.
+    from app.core.costs import CostError
+
+    def failing_estimate(*args):
+        raise CostError("cannot price")
+
+    monkeypatch.setattr("app.core.router.estimate_cost", failing_estimate)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.router"):
+        outcome = Harness(EASY_JEV, [malformed_with_usage(9, 64), ok(CHEAP[1])]).run()
+
+    assert (outcome.status, outcome.cost, outcome.attempt_costs) == ("success", None, (None, None))
+    assert sorted(cost_warnings(caplog)) == [  # One per distinct call; their order is not part of the contract
+        "attempt cost unavailable request_id=req-1 attempt=0 error_type=CostError",
+        "route cost unavailable request_id=req-1 error_type=CostError",
+    ]

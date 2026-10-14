@@ -97,6 +97,9 @@ class RouteOutcome:
     strong_reserved: bool  # True when this request consumed one unit of the strong daily budget
     execution: Optional[ExecutionResult]  # Set only when status == "success"
     attempts: Tuple[Attempt, ...]  # Every model attempt, successful or not; empty for dry runs
+    # List-price estimate per attempt, aligned with `attempts`; None when the attempt reported no usable
+    # token usage (failures without usage, deadline entries) or could not be priced. Never zero by default.
+    attempt_costs: Tuple[Optional[float], ...]
     failure_reason: Optional[ExhaustionReason]  # Set only when status == "failed"
     total_latency_ms: int
     config_version: str
@@ -107,6 +110,10 @@ class RouteOutcome:
     jev_http_status: Optional[int] = None
     # httpx exception class behind a Jev timeout or network failure (e.g. "ConnectError"); else None
     jev_error_cause: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if len(self.attempt_costs) != len(self.attempts):
+            raise ValueError("attempt_costs must have one entry per attempt")
 
 
 async def route(prompt: str, *, dry_run: bool, deps: RouterDeps) -> RouteOutcome:
@@ -140,6 +147,7 @@ async def route(prompt: str, *, dry_run: bool, deps: RouterDeps) -> RouteOutcome
         )
         raise
 
+    cost = _estimate_cost(execution, deps.config, request_id)
     outcome = RouteOutcome(
         request_id=request_id,
         status=status,
@@ -148,10 +156,11 @@ async def route(prompt: str, *, dry_run: bool, deps: RouterDeps) -> RouteOutcome
         strong_reserved=reserved,
         execution=execution,
         attempts=attempts,
+        attempt_costs=_attempt_costs(attempts, execution, cost, deps.config, request_id),
         failure_reason=failure_reason,
         total_latency_ms=_elapsed_ms(deps.clock, started),
         config_version=deps.config.config_version,
-        cost=_estimate_cost(execution, deps.config, request_id),
+        cost=cost,
         jev_http_status=jev_http_status,
         jev_error_cause=jev_error_cause,
     )
@@ -183,6 +192,39 @@ def _estimate_cost(
         logger.warning(
             "route cost unavailable request_id=%s error_type=%s",
             request_id,
+            error_type,
+            extra={"request_id": request_id, "error_type": error_type},
+        )
+        return None
+
+
+def _attempt_costs(
+    attempts: Tuple[Attempt, ...],
+    execution: Optional[ExecutionResult],
+    cost: Optional[CostEstimate],
+    config: ModelConfig,
+    request_id: str,
+) -> Tuple[Optional[float], ...]:
+    if execution is None:
+        return tuple(_attempt_cost(seq, attempt, config, request_id) for seq, attempt in enumerate(attempts))
+    # The executor appends the successful attempt last. It is the call the request cost already priced
+    # (same model and tokens), so reuse that estimate; a CostError there was logged once by _estimate_cost.
+    earlier = tuple(_attempt_cost(seq, attempt, config, request_id) for seq, attempt in enumerate(attempts[:-1]))
+    return (*earlier, cost.est_cost_usd if cost else None)
+
+
+def _attempt_cost(seq: int, attempt: Attempt, config: ModelConfig, request_id: str) -> Optional[float]:
+    if attempt.input_tokens is None or attempt.output_tokens is None:
+        return None  # No usage reported (or no call made): the cost is unknown, not zero
+    try:
+        return estimate_cost(config, attempt.model, attempt.input_tokens, attempt.output_tokens).est_cost_usd
+    except CostError as exc:
+        # Position and class name only: the message names the model and token counts.
+        error_type = type(exc).__name__
+        logger.warning(
+            "attempt cost unavailable request_id=%s attempt=%s error_type=%s",
+            request_id,
+            seq,
             error_type,
             extra={"request_id": request_id, "error_type": error_type},
         )

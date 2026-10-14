@@ -70,7 +70,11 @@ def assert_stored_exactly(engine, rows: OutcomeRows) -> None:
         if expected[name] is not None:
             expected[name] = expected[name].quantize(CENT_MILLIONTHS)
     assert stored == expected
-    assert stored_calls(engine, rows.request["id"]) == [dict(call) for call in rows.model_calls]
+    expected_calls = [dict(call) for call in rows.model_calls]
+    for call in expected_calls:
+        if call["est_cost_usd"] is not None:
+            call["est_cost_usd"] = call["est_cost_usd"].quantize(CENT_MILLIONTHS)
+    assert stored_calls(engine, rows.request["id"]) == expected_calls
 
 
 def test_save_outcome_persists_the_request_and_its_attempts_in_order(engine, created):
@@ -80,6 +84,16 @@ def test_save_outcome_persists_the_request_and_its_attempts_in_order(engine, cre
     save_outcome(engine, rows)
 
     assert_stored_exactly(engine, rows)
+    # S2.11: unpriced attempts are SQL NULL; the success is priced at NUMERIC(12, 8), equal to the request cost
+    calls = stored_calls(engine, rows.request["id"])
+    assert [(call["seq"], call["status"]) for call in calls] == [
+        (0, "client_error"),
+        (1, "client_error"),
+        (2, "success"),
+    ]
+    assert [call["est_cost_usd"] for call in calls[:2]] == [None, None]
+    assert str(calls[2]["est_cost_usd"]) == "0.00004665"  # 13 x 0.05 + 115 x 0.40 per million, float noise rounded
+    assert calls[2]["est_cost_usd"] == stored_request(engine, rows.request["id"])["est_cost_usd"]
 
 
 def test_every_outcome_shape_route_returns_is_accepted(engine, created):
