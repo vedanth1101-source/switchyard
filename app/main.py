@@ -28,6 +28,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.infra.logging import REQUEST_ID, configure_logging
 from app.routes import health
+from app.routes import requests as requests_api
 from app.routes import route as route_api
 from app.routes.route import REQUEST_ID_HEADER, InternalErrorResponse, ValidationErrorItem, ValidationErrorResponse
 
@@ -38,7 +39,7 @@ FRONTEND_DIR = "web/dist"
 
 # Included under API_PREFIX by create_app(), which also reads their routes for the catch-all's 405s.
 API_PREFIX = "/api"
-API_ROUTERS = (health.router, route_api.router)
+API_ROUTERS = (health.router, route_api.router, requests_api.router)
 
 
 def create_app(frontend_dir: str | PathLike[str] = FRONTEND_DIR) -> FastAPI:

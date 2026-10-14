@@ -14,6 +14,10 @@ RouteOutcome.attempt_costs by position; the router prices them, this module neve
 save_outcome() writes the rows in one transaction: all of them or none. A repeated save of the same
 request_id fails on the primary key (IntegrityError) instead of duplicating rows. Errors propagate to
 the caller (S2.5 decides the failure policy); nothing here logs.
+
+load_request() (S2.13) reads one saved request and its model calls, ordered by `seq`, in one transaction
+under the same statement timeout, and returns them as stored (including prompt_hash and created_at):
+callers choose what to expose. It returns None for an unknown id; errors propagate.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
 
 from app.core.executor import Attempt
@@ -115,6 +119,27 @@ def save_outcome(engine: Engine, rows: OutcomeRows) -> None:
         connection.execute(RequestRecord.__table__.insert(), [dict(rows.request)])
         if rows.model_calls:
             connection.execute(ModelCallRecord.__table__.insert(), [dict(call) for call in rows.model_calls])
+
+
+def load_request(engine: Engine, request_id: uuid.UUID) -> Optional[OutcomeRows]:
+    """
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: The database failed or timed out.
+    """
+    requests, model_calls = RequestRecord.__table__, ModelCallRecord.__table__
+    with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            connection.execute(text(f"SET LOCAL statement_timeout = {TIMEOUT_SECONDS * 1000}"))
+        request = connection.execute(select(requests).where(requests.c.id == request_id)).mappings().one_or_none()
+        if request is None:
+            return None
+        calls = connection.execute(
+            select(model_calls).where(model_calls.c.request_id == request_id).order_by(model_calls.c.seq)
+        ).mappings()
+        return OutcomeRows(
+            request=MappingProxyType(dict(request)),
+            model_calls=tuple(MappingProxyType(dict(call)) for call in calls),
+        )
 
 
 def _model_call(request_id: uuid.UUID, seq: int, attempt: Attempt, cost: Optional[float]) -> Mapping[str, Any]:
