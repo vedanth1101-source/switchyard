@@ -19,9 +19,10 @@ import uuid
 from os import PathLike
 from pathlib import PurePath
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -35,6 +36,10 @@ logger = logging.getLogger(__name__)
 # Relative to the working directory: the project root locally and on Vercel.
 FRONTEND_DIR = "web/dist"
 
+# Included under API_PREFIX by create_app(), which also reads their routes for the catch-all's 405s.
+API_PREFIX = "/api"
+API_ROUTERS = (health.router, route_api.router)
+
 
 def create_app(frontend_dir: str | PathLike[str] = FRONTEND_DIR) -> FastAPI:
     configure_logging()
@@ -46,22 +51,38 @@ def create_app(frontend_dir: str | PathLike[str] = FRONTEND_DIR) -> FastAPI:
     )
     application.add_middleware(RequestIdMiddleware)
     application.add_exception_handler(RequestValidationError, _validation_error)
-    application.include_router(health.router, prefix="/api")
-    application.include_router(route_api.router, prefix="/api")
+    for router in API_ROUTERS:
+        application.include_router(router, prefix=API_PREFIX)
+    allow_by_path = _allow_without_get(API_ROUTERS)
 
     # Unknown /api paths must be a JSON 404, not the frontend's index.html navigation fallback.
     # Keep this after every API router: Starlette uses the first full match, so API routes
     # registered later would be shadowed. GET only, so wrong-method requests to real API
-    # routes still return 405.
+    # routes still return 405. A GET to a real API route without GET (e.g. /api/route) reaches
+    # this handler too, because it matches here fully; it gets the same 405 and Allow (S2.12).
     @application.get("/api", include_in_schema=False)
     @application.get("/api/{path:path}", include_in_schema=False)
-    def api_not_found() -> None:
+    def api_not_found(request: Request) -> None:
+        path = request.path_params.get("path")
+        allow = allow_by_path.get(f"{API_PREFIX}/{path}") if path is not None else None
+        if allow is not None:
+            raise HTTPException(status_code=405, headers={"Allow": allow})
         raise HTTPException(status_code=404)
 
     # check_dir defaults to "auto": a missing build (or missing index.html) raises at startup
     # unless FASTAPI_ENV=development, where FastAPI only warns.
     application.frontend("/", directory=frontend_dir, fallback="index.html")
     return application
+
+
+def _allow_without_get(routers: tuple[APIRouter, ...]) -> dict[str, str]:
+    """Allow header value per API path whose routes do not accept GET. Exact paths: none take parameters."""
+    methods: dict[str, set[str]] = {}
+    for router in routers:
+        for route in router.routes:
+            if isinstance(route, APIRoute):
+                methods.setdefault(API_PREFIX + route.path, set()).update(route.methods)
+    return {path: ", ".join(sorted(allowed)) for path, allowed in methods.items() if "GET" not in allowed}
 
 
 def _is_api_path(path: str) -> bool:
