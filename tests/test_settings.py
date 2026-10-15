@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -331,3 +334,34 @@ def test_timeouts_from_the_environment_are_cross_checked(monkeypatch):
 
     assert "jev_timeout_seconds" in str(excinfo.value)
     assert str(JEV_TIMEOUT) not in str(excinfo.value)
+
+
+# --- Unit-test isolation from the developer's shell (tests/conftest.py) ---------------------
+
+# Unit tests that assume the rate-limit variables are unset (default limit, no salt, socket peer).
+SHELL_SENSITIVE_UNIT_TESTS = (
+    "tests/test_route_api.py::test_real_limiter_without_a_salt_fails_open_without_contacting_redis",
+    "tests/test_route_api.py::test_allowed_request_is_checked_once_against_the_socket_peer_then_routed",
+    "tests/test_ratelimit.py::test_factory_default_limit_is_ten_per_minute",
+)
+
+
+def test_unit_tests_ignore_rate_limit_settings_exported_in_the_shell():
+    # A developer shell that exports the rate-limit variables (e.g. from .env) must not change unit tests.
+    env = {
+        name: value for name, value in os.environ.items() if name not in {"JEVSTATION_API_KEY", "AI_GATEWAY_API_KEY"}
+    }
+    env.update({"RATE_LIMIT_IP_SALT": FAKE_SALT, "CLIENT_IP_HEADER": "x-real-ip", "RATE_LIMIT_PER_MIN": "3"})
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q", *SHELL_SENSITIVE_UNIT_TESTS],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output[-3000:]
+    assert f"{len(SHELL_SENSITIVE_UNIT_TESTS)} passed" in output
