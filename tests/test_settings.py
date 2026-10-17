@@ -336,6 +336,100 @@ def test_timeouts_from_the_environment_are_cross_checked(monkeypatch):
     assert str(JEV_TIMEOUT) not in str(excinfo.value)
 
 
+# --- S2.14 response cache -------------------------------------------------------------------
+
+S2_14_ENV_VARS = ("CACHE_NAMESPACE", "CACHE_KEY_SECRET", "CACHE_TTL_SECONDS")
+FAKE_CACHE_SECRET = "fake-cache-key-secret-for-tests-0123456789"
+
+
+@pytest.fixture
+def clear_s2_14_env(monkeypatch):
+    for name in S2_14_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_cache_defaults(clear_s2_14_env):
+    settings = Settings()
+
+    assert (settings.cache_namespace, settings.cache_key_secret, settings.cache_ttl_seconds) == (None, None, 86400)
+
+
+def test_cache_environment_overrides(clear_s2_14_env, monkeypatch):
+    monkeypatch.setenv("CACHE_NAMESPACE", "production")
+    monkeypatch.setenv("CACHE_KEY_SECRET", FAKE_CACHE_SECRET)
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "3600")
+
+    settings = Settings()
+
+    assert (settings.cache_namespace, settings.cache_ttl_seconds) == ("production", 3600)
+    assert settings.cache_key_secret.get_secret_value() == FAKE_CACHE_SECRET
+
+
+@pytest.mark.parametrize("name", ["CACHE_NAMESPACE", "CACHE_KEY_SECRET"])
+@pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "spaces"])
+def test_blank_cache_strings_are_unset(clear_s2_14_env, monkeypatch, name, blank):
+    monkeypatch.setenv(name, blank)
+
+    assert getattr(Settings(), name.lower()) is None
+
+
+def test_empty_cache_ttl_uses_the_default(clear_s2_14_env, monkeypatch):
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "")
+
+    assert Settings().cache_ttl_seconds == 86400
+
+
+def test_cache_namespace_is_stripped(clear_s2_14_env, monkeypatch):
+    monkeypatch.setenv("CACHE_NAMESPACE", "  preview\n")
+
+    assert Settings().cache_namespace == "preview"
+
+
+INVALID_CACHE_VALUES = [
+    ("CACHE_NAMESPACE", "pro:duction"),  # ":" separates key parts
+    ("CACHE_NAMESPACE", "Production"),
+    ("CACHE_NAMESPACE", "pre view"),
+    ("CACHE_NAMESPACE", "-preview"),
+    ("CACHE_NAMESPACE", "p" * 33),
+    ("CACHE_KEY_SECRET", "too-short-secret"),
+    ("CACHE_TTL_SECONDS", "0"),
+    ("CACHE_TTL_SECONDS", "-1"),
+    ("CACHE_TTL_SECONDS", "day"),
+    ("CACHE_TTL_SECONDS", "1.5"),
+]
+
+
+@pytest.mark.parametrize(("name", "value"), INVALID_CACHE_VALUES)
+def test_invalid_cache_value_fails_naming_the_field_without_the_input(clear_s2_14_env, monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    message = str(excinfo.value)
+    assert name.lower() in message
+    assert "input_value" not in message
+    assert value not in message
+
+
+def test_cache_boundary_values_are_accepted(clear_s2_14_env, monkeypatch):
+    monkeypatch.setenv("CACHE_NAMESPACE", "p" * 32)
+    monkeypatch.setenv("CACHE_KEY_SECRET", "s" * 32)
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "1")
+
+    settings = Settings()
+
+    assert (settings.cache_namespace, settings.cache_ttl_seconds) == ("p" * 32, 1)
+
+
+def test_cache_key_secret_is_never_rendered(clear_s2_14_env, monkeypatch):
+    monkeypatch.setenv("CACHE_KEY_SECRET", FAKE_CACHE_SECRET)
+    settings = Settings()
+
+    for rendered in (repr(settings), str(settings), settings.model_dump_json(), repr(settings.model_dump())):
+        assert FAKE_CACHE_SECRET not in rendered
+
+
 # --- Unit-test isolation from the developer's shell (tests/conftest.py) ---------------------
 
 # Unit tests that assume the rate-limit variables are unset (default limit, no salt, socket peer).
@@ -365,3 +459,35 @@ def test_unit_tests_ignore_rate_limit_settings_exported_in_the_shell():
     output = result.stdout + result.stderr
     assert result.returncode == 0, output[-3000:]
     assert f"{len(SHELL_SENSITIVE_UNIT_TESTS)} passed" in output
+
+
+def test_unit_tests_ignore_cache_settings_exported_in_the_shell():
+    # REDIS_URL too: with it exported, a shell's cache settings would otherwise configure the cache.
+    tests = (
+        "tests/test_cache.py::test_cache_is_disabled_by_default",
+        "tests/test_cache.py::test_cache_config_ttl_defaults_to_a_day",
+    )
+    env = {
+        name: value for name, value in os.environ.items() if name not in {"JEVSTATION_API_KEY", "AI_GATEWAY_API_KEY"}
+    }
+    env.update(
+        {
+            "REDIS_URL": "redis://localhost:6379/0",
+            "CACHE_NAMESPACE": "shell",
+            "CACHE_KEY_SECRET": FAKE_CACHE_SECRET,
+            "CACHE_TTL_SECONDS": "5",
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q", *tests],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output[-3000:]
+    assert f"{len(tests)} passed" in output

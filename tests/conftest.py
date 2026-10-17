@@ -15,8 +15,17 @@ if str(repo_root) not in sys.path:
 os.environ.setdefault("FASTAPI_ENV", "development")
 
 # Removed for every unit test: a developer shell may export them (e.g. from .env), and unit tests assume
-# the defaults (no database or Redis, default rate limit, no salt, socket peer as the client IP).
-UNIT_TEST_UNSET_ENV = ("DATABASE_URL", "REDIS_URL", "RATE_LIMIT_IP_SALT", "CLIENT_IP_HEADER", "RATE_LIMIT_PER_MIN")
+# the defaults (no database or Redis, default rate limit, no salt, socket peer as the client IP, cache off).
+UNIT_TEST_UNSET_ENV = (
+    "DATABASE_URL",
+    "REDIS_URL",
+    "RATE_LIMIT_IP_SALT",
+    "CLIENT_IP_HEADER",
+    "RATE_LIMIT_PER_MIN",
+    "CACHE_NAMESPACE",
+    "CACHE_KEY_SECRET",
+    "CACHE_TTL_SECONDS",
+)
 
 
 @pytest.fixture(autouse=True)
