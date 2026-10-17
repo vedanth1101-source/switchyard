@@ -2,14 +2,19 @@
 
 import asyncio
 import logging
+import threading
 import uuid
 
 import fakeredis
 import pytest
 import redis
+import sqlalchemy
 from pydantic import SecretStr
 
+from app.core.settings import get_settings
+from app.db.repo import OutcomeRowsError
 from app.infra.cache import CacheConfig, ResponseCache
+from app.infra.db import get_engine
 from app.routes import route as route_api
 from tests.fakes import FakeBudget, FakeRateLimiter
 from tests.test_route_api import CHEAP, CONFIG, EASY_JEV, HARD_JEV, PROMPT, STRONG, ApiHarness, client_error, ok
@@ -345,3 +350,145 @@ def test_openapi_documents_use_cache_and_cache_hit():
     assert (use_cache["type"], use_cache["default"]) == ("boolean", False)
     assert schemas["RouteResponse"]["properties"]["cache_hit"]["type"] == "boolean"
     assert "cache_hit" in schemas["RouteResponse"]["required"]
+
+
+# --- S2.14 step 4: hits are persisted -----------------------------------------------------------------
+
+
+def with_hit_recorder(harness: ApiHarness, recorder) -> None:
+    harness.client.app.dependency_overrides[route_api.get_hit_recorder] = lambda: recorder
+
+
+class RowsSpy:
+    def __init__(self, error: Exception | None = None, events: list | None = None):
+        self.rows: list = []
+        self.error = error
+        self.events = events
+
+    async def __call__(self, rows):
+        if self.events is not None:
+            self.events.append("persist")
+        self.rows.append(rows)
+        if self.error is not None:
+            raise self.error
+
+
+def hit_harness(server, recorder, events=None) -> ApiHarness:
+    harness = ApiHarness(EASY_JEV, [])
+    with_cache(harness, make_cache(server, events=events))
+    with_hit_recorder(harness, recorder)
+    return harness
+
+
+def test_hit_is_recorded_once_as_a_cache_hit_row_under_its_request_id():
+    server = fakeredis.FakeServer()
+    fill(server)
+    recorder = RowsSpy()
+
+    body = hit_harness(server, recorder).post({"prompt": PROMPT, "use_cache": True}).json()
+
+    assert body["cache_hit"] is True
+    (rows,) = recorder.rows
+    assert rows.request["id"] == uuid.UUID(body["request_id"])
+    assert (rows.request["cache_hit"], rows.request["status"], rows.request["final_model"]) == (
+        True,
+        "success",
+        CHEAP[0],
+    )
+    assert rows.request["total_latency_ms"] == body["total_latency_ms"]
+    assert rows.model_calls == ()
+
+
+def test_misses_never_use_the_hit_recorder():
+    server = fakeredis.FakeServer()
+    recorder = RowsSpy()
+    harness = ApiHarness(EASY_JEV, [ok(CHEAP[0])])
+    with_cache(harness, make_cache(server))
+    with_hit_recorder(harness, recorder)
+
+    assert harness.post({"prompt": PROMPT, "use_cache": True}).json()["cache_hit"] is False
+    assert recorder.rows == []
+
+
+def test_hit_is_persisted_before_the_cache_is_closed():
+    server = fakeredis.FakeServer()
+    fill(server)
+    events = []
+
+    hit_harness(server, RowsSpy(events=events), events).post({"prompt": PROMPT, "use_cache": True})
+
+    assert events == ["lookup", "persist", "aclose"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [sqlalchemy.exc.OperationalError("INSERT", {}, Exception("postgresql://user:pw@db")), OutcomeRowsError("x")],
+    ids=["database", "mapping"],
+)
+def test_hit_persistence_failure_keeps_the_hit_response_and_logs_only_the_type(caplog, error):
+    server = fakeredis.FakeServer()
+    fill(server)
+
+    with caplog.at_level(logging.WARNING, logger="app.routes.route"):
+        response = hit_harness(server, RowsSpy(error=error)).post({"prompt": PROMPT, "use_cache": True})
+
+    assert (response.status_code, response.json()["cache_hit"]) == (200, True)
+    failures = [r for r in caplog.records if r.name == "app.routes.route" and r.levelno == logging.WARNING]
+    assert [(r.request_id, r.error_type) for r in failures] == [(response.json()["request_id"], type(error).__name__)]
+    assert "pw@db" not in caplog.text
+
+
+def test_unexpected_hit_recorder_error_reaches_the_generic_500():
+    server = fakeredis.FakeServer()
+    fill(server)
+
+    response = hit_harness(server, RowsSpy(error=RuntimeError("bug"))).post({"prompt": PROMPT, "use_cache": True})
+
+    assert (response.status_code, response.json()["error"]) == (500, "internal_error")
+
+
+def test_real_hit_recorder_without_a_database_skips_with_one_info_line(caplog):
+    server = fakeredis.FakeServer()
+    fill(server)
+    harness = ApiHarness(EASY_JEV, [])  # The real get_hit_recorder; DATABASE_URL is unset in unit tests
+    with_cache(harness, make_cache(server))
+    caplog.clear()  # fill()'s routed request logs its own skip line
+
+    with caplog.at_level(logging.INFO, logger="app.routes.route"):
+        body = harness.post({"prompt": PROMPT, "use_cache": True}).json()
+
+    assert body["cache_hit"] is True
+    skipped = [r for r in caplog.records if getattr(r, "reason", None) == "database_not_configured"]
+    assert [r.request_id for r in skipped] == [body["request_id"]]
+
+
+def test_real_hit_recorder_saves_the_hit_row_through_the_cached_engine_off_the_event_loop(monkeypatch):
+    server = fakeredis.FakeServer()
+    fill(server)
+    database_url = "postgresql+psycopg://user@localhost:5432/switchyard"  # The engine is built, never connected
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    seen = {}
+    real_cache_hit_to_rows = route_api.cache_hit_to_rows
+
+    def mapping_on_the_loop(**kwargs):
+        seen["mapping_thread"] = threading.get_ident()
+        return real_cache_hit_to_rows(**kwargs)
+
+    def capture_save(engine, rows):
+        seen.update(engine=engine, rows=rows, save_thread=threading.get_ident())
+
+    monkeypatch.setattr(route_api, "cache_hit_to_rows", mapping_on_the_loop)
+    monkeypatch.setattr(route_api, "save_outcome", capture_save)
+    harness = ApiHarness(EASY_JEV, [])
+    with_cache(harness, make_cache(server))
+
+    body = harness.post({"prompt": PROMPT, "use_cache": True}).json()
+
+    assert body["cache_hit"] is True
+    assert seen["engine"] is get_engine(database_url)  # The shared, cached engine
+    assert seen["rows"].request["id"] == uuid.UUID(body["request_id"])
+    assert seen["rows"].request["cache_hit"] is True
+    assert seen["save_thread"] != seen["mapping_thread"]  # save_outcome ran in Starlette's thread pool
+    get_engine.cache_clear()

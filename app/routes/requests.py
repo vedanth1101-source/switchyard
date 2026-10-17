@@ -57,8 +57,9 @@ class StoredRequestOut(BaseModel):
     total_latency_ms: int
     config_version: str
     prompt_chars: int
-    est_cost_usd: Optional[float]  # List-price estimate for the successful call; null when unknown
+    est_cost_usd: Optional[float]  # List-price estimate for the successful call; null when unknown or a cache hit
     baseline_cost_usd: Optional[float]
+    cache_hit: bool  # Answered from the response cache (S2.14): no model calls and no cost
 
 
 class StoredDecisionOut(BaseModel):

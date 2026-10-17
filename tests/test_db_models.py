@@ -50,6 +50,7 @@ REQUEST_COLUMNS = {
     "jev_error": (sa.Text, True),
     "jev_http_status": (sa.Integer, True),
     "jev_error_cause": (sa.Text, True),
+    "cache_hit": (sa.Boolean, False),  # S2.14 step 4
 }
 
 MODEL_CALL_COLUMNS = {
@@ -185,6 +186,7 @@ def test_check_constraints_present():
         "ck_requests_costs_non_negative",
         "ck_requests_tier",
         "ck_requests_reason",
+        "ck_requests_cache_hit_shape",  # S2.14 step 4
     }
     assert check_names(MODEL_CALLS) == {
         "ck_model_calls_seq_non_negative",
@@ -224,3 +226,18 @@ def test_value_set_checks_list_every_allowed_value():
 def test_task_type_is_not_constrained():
     # The classifier passes through whatever task_type Jev chooses; the database must accept it.
     assert not [name for name in check_names(REQUESTS) if "task_type" in name]
+
+
+def test_cache_hit_defaults_to_false_in_the_database():
+    cache_hit = columns(REQUESTS)["cache_hit"]
+
+    assert cache_hit.server_default is not None
+    assert "cache_hit BOOLEAN DEFAULT false NOT NULL" in ddl(REQUESTS)
+    assert list(columns(REQUESTS))[-1] == "cache_hit"  # Last, as ALTER TABLE ... ADD COLUMN places it
+
+
+def test_cache_hit_rows_are_constrained_to_the_hit_shape():
+    assert (
+        "CONSTRAINT ck_requests_cache_hit_shape CHECK (NOT cache_hit OR (status = 'success' AND NOT dry_run"
+        " AND NOT strong_reserved AND est_cost_usd IS NULL AND NOT fell_back_to_cheap))"
+    ) in re.sub(r"\s+", " ", ddl(REQUESTS))

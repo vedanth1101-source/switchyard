@@ -2,7 +2,8 @@
 PostgreSQL tables for routed requests (Task S2.3; docs/04 Part A, trimmed by the S2.3 decisions).
 
 `requests` holds one row per outcome returned by app.core.router.route() (success, dry run or failed),
-including its routing decision; `model_calls` holds one row per model attempt, in order (`seq`). Rows
+including its routing decision, and one per response-cache hit (S2.14: `cache_hit`, no model calls);
+`model_calls` holds one row per model attempt, in order (`seq`). Rows
 are written once, in one transaction, after route() returns (S2.4/S2.5) and never updated. Nothing is
 written when route() raises: setup errors, RoutingConfigError and unexpected exceptions leave logs only.
 
@@ -37,7 +38,7 @@ SQLModel.metadata.naming_convention = {
 ROUTE_STATUSES = ("success", "dry_run", "failed")  # app.core.router.RouteStatus
 FAILURE_REASONS = ("all_failed", "deadline", "fatal")  # app.core.executor.ExhaustionReason
 TIERS = ("cheap", "strong")  # app.core.policy.RouteDecision.tier
-ROUTE_REASONS = ("EASY", "HARD", "LOW_CONFIDENCE", "JEV_ERROR", "BUDGET")  # policy reasons; CACHE not yet used
+ROUTE_REASONS = ("EASY", "HARD", "LOW_CONFIDENCE", "JEV_ERROR", "BUDGET")  # Policy reasons; hits keep theirs (U4)
 ATTEMPT_STATUSES = (  # app.core.executor.AttemptStatus
     "success",
     "rate_limited",
@@ -78,6 +79,12 @@ class RequestRecord(SQLModel, table=True):
         sa.CheckConstraint("est_cost_usd >= 0 AND baseline_cost_usd >= 0", name="costs_non_negative"),
         sa.CheckConstraint(_one_of("tier", TIERS), name="tier"),
         sa.CheckConstraint(_one_of("reason", ROUTE_REASONS), name="reason"),
+        # S2.14: a cache hit is a successful answer served without a model call, reservation or fallback.
+        sa.CheckConstraint(
+            "NOT cache_hit OR (status = 'success' AND NOT dry_run AND NOT strong_reserved"
+            " AND est_cost_usd IS NULL AND NOT fell_back_to_cheap)",
+            name="cache_hit_shape",
+        ),
     )
 
     # Request and outcome
@@ -119,6 +126,10 @@ class RequestRecord(SQLModel, table=True):
     jev_error: Optional[str] = Field(default=None, sa_column=sa.Column(sa.Text))  # Exception class name only
     jev_http_status: Optional[int] = Field(default=None, sa_column=sa.Column(sa.Integer))
     jev_error_cause: Optional[str] = Field(default=None, sa_column=sa.Column(sa.Text))  # Exception class name only
+
+    # S2.14 (migration 7b67e41902f4): True when the answer was served from the response cache. Last, as the
+    # migration's ADD COLUMN places it.
+    cache_hit: bool = Field(default=False, sa_column=sa.Column(sa.Boolean, nullable=False, server_default=sa.false()))
 
 
 class ModelCallRecord(SQLModel, table=True):

@@ -103,6 +103,19 @@ def failed_jev_error_request(**overrides) -> dict:
     return {**row, **overrides}
 
 
+def cache_hit_request(**overrides) -> dict:
+    row = success_request(
+        cache_hit=True,
+        est_cost_usd=None,
+        baseline_cost_usd=None,
+        jev_model=None,
+        jev_latency_ms=None,
+        jev_input_tokens=None,
+        jev_credits_charged=None,
+    )
+    return {**row, **overrides}
+
+
 def model_call(request_id, seq: int, **overrides) -> dict:
     row = {
         "request_id": request_id,
@@ -191,6 +204,23 @@ def test_success_dry_run_and_failed_outcomes_insert_and_round_trip(engine):
     assert statuses == ["timeout", "deadline"]
 
 
+def test_rows_inserted_without_cache_hit_default_to_false(engine):
+    # S2.14 step 4: rows written before the column existed, or by code that omits it, are not cache hits.
+    routed, hit = success_request(), cache_hit_request()
+    with engine.connect() as connection, connection.begin() as transaction:
+        connection.execute(REQUESTS.insert(), [routed])
+        connection.execute(REQUESTS.insert(), [hit])
+        stored = dict(
+            connection.execute(
+                sa.select(REQUESTS.c.id, REQUESTS.c.cache_hit).where(REQUESTS.c.id.in_([routed["id"], hit["id"]]))
+            ).all()
+        )
+        transaction.rollback()
+
+    assert "cache_hit" not in routed
+    assert stored == {routed["id"]: False, hit["id"]: True}
+
+
 def test_deleting_a_request_deletes_its_model_calls(engine):
     request = success_request()
     with engine.connect() as connection, connection.begin() as transaction:
@@ -227,6 +257,15 @@ def test_invalid_rows_are_rejected_by_constraints(engine):
         "unknown tier": success_request(tier="premium"),
         "CACHE reason before the cache exists": success_request(reason="CACHE"),
         "missing decision": success_request(model_chain=None),
+        # S2.14 step 4: a cache hit is a success with no dry run, reservation, cost or fallback.
+        "cache hit with a cost": cache_hit_request(est_cost_usd=0.1, baseline_cost_usd=0.2),
+        "cache hit on a dry run": cache_hit_request(
+            status="dry_run", dry_run=True, final_model=None, final_tier=None, fell_back_to_cheap=None
+        ),
+        "cache hit on a failure": failed_jev_error_request(cache_hit=True, strong_reserved=False),
+        "cache hit that reserved budget": cache_hit_request(strong_reserved=True),
+        "cache hit that fell back": cache_hit_request(fell_back_to_cheap=True),
+        "null cache_hit": success_request(cache_hit=None),
     }
     call_cases = {
         "unknown attempt status": model_call(request_id, 0, status="exploded"),
