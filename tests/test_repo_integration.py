@@ -19,7 +19,17 @@ from sqlalchemy.pool import NullPool
 from app.db.models import ModelCallRecord, RequestRecord
 from app.db.repo import OutcomeRows, outcome_to_rows, save_outcome
 from tests.test_migrations_integration import require_local_postgres_url
-from tests.test_repo_mapping import CHEAP, EASY_JEV, HARD_JEV, PROMPT, all_outcomes, client_error, ok, run_route
+from tests.test_repo_mapping import (
+    CHEAP,
+    EASY_JEV,
+    HARD_JEV,
+    PROMPT,
+    all_outcomes,
+    client_error,
+    hit_rows,
+    ok,
+    run_route,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -149,3 +159,15 @@ def test_saving_the_same_outcome_twice_fails_and_keeps_exactly_one_copy(engine, 
     assert error.value.orig.diag.constraint_name == "pk_requests"  # Refused at the request row
     assert stored_request(engine, rows.request["id"]) is not None
     assert len(stored_calls(engine, rows.request["id"])) == 2
+
+
+def test_cache_hit_rows_save_and_read_back_exactly(engine, created):
+    rows = hit_rows()
+    created.append(rows.request["id"])
+
+    save_outcome(engine, rows)
+
+    assert_stored_exactly(engine, rows)
+    stored = stored_request(engine, rows.request["id"])
+    assert (stored["cache_hit"], stored["status"], stored["est_cost_usd"]) == (True, "success", None)
+    assert stored_calls(engine, rows.request["id"]) == []

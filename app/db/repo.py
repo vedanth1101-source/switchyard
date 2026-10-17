@@ -15,6 +15,9 @@ save_outcome() writes the rows in one transaction: all of them or none. A repeat
 request_id fails on the primary key (IntegrityError) instead of duplicating rows. Errors propagate to
 the caller (S2.5 decides the failure policy); nothing here logs.
 
+cache_hit_to_rows() (S2.14) maps a response-cache hit to one `requests` row with `cache_hit` true and no
+model calls; outcome_to_rows() sets `cache_hit` false.
+
 load_request() (S2.13) reads one saved request and its model calls, ordered by `seq`, in one transaction
 under the same statement timeout, and returns them as stored (including prompt_hash and created_at):
 callers choose what to expose. It returns None for an unknown id; errors propagate.
@@ -36,6 +39,7 @@ from sqlalchemy.engine import Engine
 from app.core.executor import Attempt
 from app.core.router import RouteOutcome
 from app.db.models import ModelCallRecord, RequestRecord
+from app.infra.cache import CachedAnswer
 from app.infra.db import TIMEOUT_SECONDS
 
 _CLASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -57,18 +61,11 @@ def outcome_to_rows(outcome: RouteOutcome, *, prompt: str) -> OutcomeRows:
         OutcomeRowsError: If request_id is not a UUID, the prompt is empty, or a Jev error field is not
             an exception class name. Messages never include the offending value.
     """
-    try:
-        request_id = uuid.UUID(outcome.request_id)
-    except (ValueError, AttributeError, TypeError):
-        raise OutcomeRowsError("request_id must be a UUID") from None
-    if not prompt:
-        raise OutcomeRowsError("prompt must not be empty")
-
+    request_id = _request_uuid(outcome.request_id)
     decision, jev, execution, cost = outcome.decision, outcome.jev, outcome.execution, outcome.cost
     request = {
         "id": request_id,
-        "prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        "prompt_chars": len(prompt),
+        **_prompt_fields(prompt),
         "dry_run": outcome.status == "dry_run",  # route() returns "dry_run" exactly for dry runs
         "status": outcome.status,
         "failure_reason": outcome.failure_reason,
@@ -96,12 +93,60 @@ def outcome_to_rows(outcome: RouteOutcome, *, prompt: str) -> OutcomeRows:
         "jev_error": _class_name(decision.jev_error, "jev_error"),
         "jev_http_status": outcome.jev_http_status,
         "jev_error_cause": _class_name(outcome.jev_error_cause, "jev_error_cause"),
+        "cache_hit": False,
     }
     model_calls = tuple(
         _model_call(request_id, seq, attempt, cost)
         for seq, (attempt, cost) in enumerate(zip(outcome.attempts, outcome.attempt_costs, strict=True))
     )
     return OutcomeRows(request=MappingProxyType(request), model_calls=model_calls)
+
+
+def cache_hit_to_rows(
+    *, request_id: str, prompt: str, answer: CachedAnswer, config_version: str, total_latency_ms: int
+) -> OutcomeRows:
+    """
+    One `requests` row for a request answered from the response cache (S2.14): the cached decision and
+    final model, `cache_hit` true, no model calls, no strong reservation, no cost, and null Jev data
+    (this request made no Jev call). The answer text is not mapped.
+
+    Raises:
+        OutcomeRowsError: If request_id is not a UUID or the prompt is empty.
+    """
+    decision, response = answer.decision, answer.response
+    request = {
+        "id": _request_uuid(request_id),
+        **_prompt_fields(prompt),
+        "dry_run": False,
+        "status": "success",
+        "failure_reason": None,
+        "final_model": response.model,
+        "final_tier": response.tier,
+        "fell_back_to_cheap": False,  # Fallback answers are never cached
+        "strong_reserved": False,
+        "total_latency_ms": total_latency_ms,
+        "config_version": config_version,
+        "est_cost_usd": None,  # No model call was made
+        "baseline_cost_usd": None,
+        "task_type": decision.task_type,
+        "tier": decision.tier,
+        "reason": decision.reason,
+        "model_chain": list(decision.model_chain),
+        "confidence": decision.confidence,
+        "difficulty": decision.difficulty,
+        "needs_reasoning_prob": decision.needs_reasoning_prob,
+        "task_type_probs": dict(decision.task_type_probs) if decision.task_type_probs is not None else None,
+        "difficulty_dist": dict(decision.difficulty_dist) if decision.difficulty_dist is not None else None,
+        "jev_model": None,
+        "jev_latency_ms": None,
+        "jev_input_tokens": None,
+        "jev_credits_charged": None,
+        "jev_error": None,
+        "jev_http_status": None,
+        "jev_error_cause": None,
+        "cache_hit": True,
+    }
+    return OutcomeRows(request=MappingProxyType(request), model_calls=())
 
 
 def save_outcome(engine: Engine, rows: OutcomeRows) -> None:
@@ -159,6 +204,19 @@ def _model_call(request_id: uuid.UUID, seq: int, attempt: Attempt, cost: Optiona
             "est_cost_usd": _usd(cost) if cost is not None else None,
         }
     )
+
+
+def _request_uuid(request_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(request_id)
+    except (ValueError, AttributeError, TypeError):
+        raise OutcomeRowsError("request_id must be a UUID") from None
+
+
+def _prompt_fields(prompt: str) -> dict[str, Any]:
+    if not prompt:
+        raise OutcomeRowsError("prompt must not be empty")
+    return {"prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "prompt_chars": len(prompt)}
 
 
 def _usd(value: float) -> Decimal:

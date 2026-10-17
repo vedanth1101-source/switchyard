@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,7 +24,8 @@ from app.core.model_config import load_model_config
 from app.core.router import RouteOutcome, RouterDeps, route
 from app.db import models
 from app.db.models import ModelCallRecord, RequestRecord
-from app.db.repo import OutcomeRows, outcome_to_rows
+from app.db.repo import OutcomeRows, OutcomeRowsError, cache_hit_to_rows, outcome_to_rows
+from app.infra.cache import answer_from_outcome, classifier_version
 from tests.fakes import FakeBudget, FakeClock, FakeJev, FakeLLM, RecordingSleep
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -493,3 +495,96 @@ def test_jev_error_fields_that_are_not_class_names_are_refused_without_echoing_t
         outcome_to_rows(outcome, prompt=PROMPT)
 
     assert SECRET not in str(error.value)
+
+
+# --- S2.14 step 4: cache hits ------------------------------------------------------------------
+
+
+def cached_answer(outcome=None):
+    outcome = outcome or run_route(EASY_JEV, [ok(CHEAP[0])])
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    return answer_from_outcome(outcome, classifier_version=classifier_version(), now=now)
+
+
+def hit_rows(answer=None, *, request_id=None, prompt=PROMPT, latency_ms=12) -> OutcomeRows:
+    return cache_hit_to_rows(
+        request_id=request_id or str(uuid.uuid4()),
+        prompt=prompt,
+        answer=answer or cached_answer(),
+        config_version=CONFIG.config_version,
+        total_latency_ms=latency_ms,
+    )
+
+
+def test_routed_outcomes_are_never_marked_as_cache_hits():
+    for outcome in all_outcomes():
+        assert outcome_to_rows(outcome, prompt=PROMPT).request["cache_hit"] is False
+
+
+def test_cache_hit_maps_the_cached_decision_and_answer_without_calls_or_cost():
+    answer = cached_answer()
+    request_id = str(uuid.uuid4())
+
+    rows = hit_rows(answer, request_id=request_id, latency_ms=12)
+
+    request = rows.request
+    assert rows.model_calls == ()
+    assert set(request) == REQUEST_COLUMNS
+    assert (request["id"], request["cache_hit"], request["status"], request["dry_run"]) == (
+        uuid.UUID(request_id),
+        True,
+        "success",
+        False,
+    )
+    assert (request["final_model"], request["final_tier"], request["fell_back_to_cheap"]) == (CHEAP[0], "cheap", False)
+    assert (request["strong_reserved"], request["est_cost_usd"], request["baseline_cost_usd"]) == (False, None, None)
+    assert (request["total_latency_ms"], request["config_version"], request["failure_reason"]) == (
+        12,
+        CONFIG.config_version,
+        None,
+    )
+    decision = answer.decision
+    assert (request["task_type"], request["tier"], request["reason"]) == (decision.task_type, "cheap", "EASY")
+    assert request["model_chain"] == decision.model_chain
+    assert (request["confidence"], request["difficulty"], request["needs_reasoning_prob"]) == (
+        decision.confidence,
+        decision.difficulty,
+        decision.needs_reasoning_prob,
+    )
+    assert (request["task_type_probs"], request["difficulty_dist"]) == (
+        decision.task_type_probs,
+        decision.difficulty_dist,
+    )
+    jev_fields = ("jev_model", "jev_latency_ms", "jev_input_tokens", "jev_credits_charged", "jev_error")
+    assert [request[name] for name in (*jev_fields, "jev_http_status", "jev_error_cause")] == [None] * 7
+
+
+def test_cache_hit_reduces_the_prompt_to_its_hash_and_length_and_drops_the_answer():
+    rows = hit_rows(prompt=PROMPT)
+
+    assert rows.request["prompt_hash"] == hashlib.sha256(PROMPT.encode("utf-8")).hexdigest()
+    assert rows.request["prompt_chars"] == len(PROMPT)
+    assert "PROMPT-MARKER" not in all_values(rows)
+    assert "ANSWER-MARKER" not in all_values(rows)
+
+
+def test_cache_hit_of_a_jev_error_answer_keeps_null_jev_data():
+    error = JevTimeoutError("t", cause_type="ReadTimeout")
+
+    request = hit_rows(cached_answer(run_route(error, [ok(STRONG[0])]))).request
+
+    assert (request["reason"], request["task_type_probs"], request["confidence"]) == ("JEV_ERROR", None, None)
+
+
+def test_cache_hit_rows_use_only_values_the_schema_accepts():
+    request = hit_rows().request
+
+    assert request["status"] in models.ROUTE_STATUSES
+    assert request["reason"] in models.ROUTE_REASONS
+    assert request["tier"] in models.TIERS and request["final_tier"] in models.TIERS
+
+
+@pytest.mark.parametrize(("request_id", "prompt"), [("not-a-uuid", PROMPT), (None, "")], ids=["bad-id", "empty-prompt"])
+def test_cache_hit_refuses_a_bad_request_id_or_an_empty_prompt(request_id, prompt):
+    with pytest.raises(OutcomeRowsError):
+        hit_rows(request_id=request_id or str(uuid.uuid4()), prompt=prompt)

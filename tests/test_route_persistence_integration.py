@@ -13,16 +13,19 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import fakeredis
 import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.pool import NullPool
 
 from app.core.router import RouterDeps
 from app.core.settings import get_settings
 from app.db.models import ModelCallRecord, RequestRecord
+from app.infra.cache import CacheConfig, ResponseCache
 from app.infra.db import get_engine
 from app.main import create_app
 from app.routes import route as route_api
@@ -145,3 +148,35 @@ def test_unreachable_database_still_returns_the_routing_response(monkeypatch, ca
     assert secret not in caplog.text
     assert "127.0.0.1" not in caplog.text
     get_engine.cache_clear()
+
+
+def test_cache_hit_is_saved_under_its_response_request_id(engine, created):
+    # S2.14 step 4: the real app, recorders and database; the cache is fakeredis, Jev and the gateway fakes.
+    server = fakeredis.FakeServer()
+    config = CacheConfig(
+        redis_url="redis://localhost:6379/0",
+        namespace="test",
+        key_secret=SecretStr("fake-cache-key-secret-for-tests-0123456789"),
+        ttl_seconds=60,
+    )
+    client = client_with_fake_services([ok(CHEAP[0])])
+    client.app.dependency_overrides[route_api.get_cache_factory] = lambda: (
+        lambda settings: ResponseCache(fakeredis.FakeAsyncRedis(server=server), config)
+    )
+    body = {"prompt": PROMPT, "use_cache": True}
+
+    routed, hit = client.post("/api/route", json=body), client.post("/api/route", json=body)
+    routed_id, hit_id = uuid.UUID(routed.headers["X-Request-ID"]), uuid.UUID(hit.headers["X-Request-ID"])
+    created.extend([routed_id, hit_id])
+
+    assert (routed.json()["cache_hit"], hit.json()["cache_hit"]) == (False, True)
+    stored_routed, stored_hit = stored_request(engine, routed_id), stored_request(engine, hit_id)
+    assert stored_routed["cache_hit"] is False
+    assert (stored_hit["cache_hit"], stored_hit["status"], stored_hit["final_model"]) == (True, "success", CHEAP[0])
+    assert stored_hit["prompt_hash"] == stored_routed["prompt_hash"]
+    assert (stored_hit["strong_reserved"], stored_hit["est_cost_usd"], stored_hit["jev_latency_ms"]) == (
+        False,
+        None,
+        None,
+    )
+    assert stored_calls(engine, hit_id) == []

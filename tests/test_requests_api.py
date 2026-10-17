@@ -18,7 +18,7 @@ from app.core.settings import get_settings
 from app.db.repo import OutcomeRows, outcome_to_rows
 from app.main import create_app
 from app.routes import requests as requests_api
-from tests.test_repo_mapping import CHEAP, EASY_JEV, HARD_JEV, PROMPT, STRONG, client_error, ok, run_route
+from tests.test_repo_mapping import CHEAP, EASY_JEV, HARD_JEV, PROMPT, STRONG, client_error, hit_rows, ok, run_route
 
 CREATED_AT = datetime(2026, 10, 14, 8, 30, 15, 123000, tzinfo=timezone.utc)
 SECRET = "SECRET-MARKER-postgresql://user:pw@db.internal"
@@ -95,6 +95,7 @@ def test_success_returns_the_request_decision_and_attempts():
             "prompt_chars": len(PROMPT),
             "est_cost_usd": float(request["est_cost_usd"]),
             "baseline_cost_usd": float(request["baseline_cost_usd"]),
+            "cache_hit": False,  # S2.14 step 4: added deliberately (approved read-endpoint field)
         },
         "decision": {
             "task_type": "code",
@@ -351,3 +352,18 @@ def test_decimal_costs_from_the_database_are_converted_not_dropped():
     body = response.json()
     assert (body["request"]["est_cost_usd"], body["request"]["baseline_cost_usd"]) == (0.00004665, 0.00023325)
     assert body["attempts"][0]["est_cost_usd"] == 0.00004665
+
+
+def test_cache_hit_is_reported_for_routed_requests_and_cache_hits():
+    routed = stored(run_route(EASY_JEV, [ok(CHEAP[0])]))
+    hit = hit_rows()
+    hit = OutcomeRows(request=MappingProxyType({**hit.request, "created_at": CREATED_AT}), model_calls=())
+
+    routed_body, hit_body = get(routed)[0].json(), get(hit)[0].json()
+
+    assert routed_body["request"]["cache_hit"] is False
+    assert (hit_body["request"]["cache_hit"], hit_body["request"]["est_cost_usd"], hit_body["attempts"]) == (
+        True,
+        None,
+        [],
+    )

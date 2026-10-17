@@ -36,8 +36,9 @@ answer, `attempts: []`, `strong_reserved: false` and `cost: null` (no model call
 Jev, checks or reserves strong budget, or calls a model, and the decision's Jev latency and error fields
 are null. On a miss the request routes as usual, its outcome is persisted, and then a cacheable answer is
 written. The cache fails open: when it is not configured (one INFO line) or Redis fails, the request
-routes as if `use_cache` were false. Cache hits are not persisted yet. Every other 200 has
-`cache_hit: false`.
+routes as if `use_cache` were false. Every other 200 has `cache_hit: false`. A hit is persisted before the
+response is sent, as one `requests` row with `cache_hit` true and no model calls (cache_hit_to_rows), by
+the recorder from get_hit_recorder(), failing open like outcome persistence.
 """
 
 import dataclasses
@@ -60,7 +61,7 @@ from app.core.model_config import ModelConfigError, load_model_config
 from app.core.policy import RoutingConfigError
 from app.core.router import CliConfigurationError, DepsFactory, RouteOutcome, build_cli_deps, route
 from app.core.settings import Settings, get_settings
-from app.db.repo import OutcomeRowsError, outcome_to_rows, save_outcome
+from app.db.repo import OutcomeRows, OutcomeRowsError, cache_hit_to_rows, outcome_to_rows, save_outcome
 from app.infra.cache import CachedAnswer, ResponseCache, create_response_cache
 from app.infra.db import get_engine
 from app.infra.ratelimit import RateLimiter, create_rate_limiter, resolve_client_ip
@@ -218,16 +219,36 @@ def get_outcome_recorder(settings: Settings = Depends(get_settings)) -> OutcomeR
 async def record_outcome(outcome: RouteOutcome, prompt: str, *, database_url: Optional[str]) -> None:
     """Saves one outcome and its attempts; the blocking database work runs in Starlette's thread pool."""
     if database_url is None:
-        reason = "database_not_configured"
-        logger.info(
-            "route persistence skipped request_id=%s reason=%s",
-            outcome.request_id,
-            reason,
-            extra={"request_id": outcome.request_id, "reason": reason},
-        )
+        _log_persistence_skipped(outcome.request_id)
         return
     rows = outcome_to_rows(outcome, prompt=prompt)
     await run_in_threadpool(save_outcome, get_engine(database_url), rows)
+
+
+HitRecorder = Callable[[OutcomeRows], Awaitable[None]]
+
+
+def get_hit_recorder(settings: Settings = Depends(get_settings)) -> HitRecorder:
+    """Real persistence of cache-hit rows to DATABASE_URL; tests override this."""
+    return functools.partial(record_hit, database_url=settings.database_url)
+
+
+async def record_hit(rows: OutcomeRows, *, database_url: Optional[str]) -> None:
+    """Saves one cache-hit row (cache_hit_to_rows); the blocking database work runs in the thread pool."""
+    if database_url is None:
+        _log_persistence_skipped(str(rows.request["id"]))
+        return
+    await run_in_threadpool(save_outcome, get_engine(database_url), rows)
+
+
+def _log_persistence_skipped(request_id: str) -> None:
+    reason = "database_not_configured"
+    logger.info(
+        "route persistence skipped request_id=%s reason=%s",
+        request_id,
+        reason,
+        extra={"request_id": request_id, "reason": reason},
+    )
 
 
 @router.post(
@@ -254,6 +275,7 @@ async def route_prompt(
     recorder: OutcomeRecorder = Depends(get_outcome_recorder),
     limiter: RateLimiter = Depends(get_rate_limiter),
     cache_factory: CacheFactory = Depends(get_cache_factory),
+    hit_recorder: HitRecorder = Depends(get_hit_recorder),
 ) -> Any:
     peer = request.client.host if request.client is not None else None
     limit = await limiter.check(resolve_client_ip(request.headers, peer, settings.client_ip_header))
@@ -265,7 +287,7 @@ async def route_prompt(
     try:
         try:
             if cache is not None:
-                hit = await _lookup(cache, body.prompt, settings, request_id, started)
+                hit = await _lookup(cache, body.prompt, settings, request_id, started, hit_recorder)
                 if hit is not None:
                     response.headers[REQUEST_ID_HEADER] = request_id
                     return hit
@@ -279,7 +301,7 @@ async def route_prompt(
         except (ModelConfigError, CliConfigurationError, RoutingConfigError) as exc:
             return _setup_error(500, "configuration_error", exc, request_id)
 
-        await _persist(recorder, outcome, body.prompt)  # The same prompt string route() received
+        await _persist(lambda: recorder(outcome, body.prompt), outcome.request_id)  # The prompt route() received
         if cache is not None:
             await cache.store(body.prompt, outcome)  # Writes only cacheable answers; fails open
         if outcome.status == "failed":
@@ -309,7 +331,7 @@ def _open_cache(
 
 
 async def _lookup(
-    cache: ResponseCache, prompt: str, settings: Settings, request_id: str, started: float
+    cache: ResponseCache, prompt: str, settings: Settings, request_id: str, started: float, hit_recorder: HitRecorder
 ) -> Optional[RouteResponse]:
     # The version route() would use on a miss: build_cli_deps loads the same file with the same threshold.
     # A ModelConfigError propagates to the handler's configuration_error response.
@@ -333,6 +355,18 @@ async def _lookup(
             "reason": hit.decision.reason,
             "final_model": answer.response.model,
         },
+    )
+    await _persist(
+        lambda: hit_recorder(
+            cache_hit_to_rows(
+                request_id=request_id,
+                prompt=prompt,
+                answer=answer,
+                config_version=config_version,
+                total_latency_ms=hit.total_latency_ms,
+            )
+        ),
+        request_id,
     )
     return hit
 
@@ -378,18 +412,18 @@ def _elapsed_ms(started: float) -> int:
     return max(0, int((time.monotonic() - started) * 1000))
 
 
-async def _persist(recorder: OutcomeRecorder, outcome: RouteOutcome, prompt: str) -> None:
+async def _persist(save: Callable[[], Awaitable[None]], request_id: str) -> None:
     try:
-        await recorder(outcome, prompt)
+        await save()
     except (SQLAlchemyError, OutcomeRowsError) as exc:
         # Fail open: routing availability over persistence. Type only: SQLAlchemy messages include SQL
         # (and row values when hide_parameters is off), and mapping messages name refused fields.
         error_type = type(exc).__name__
         logger.warning(
             "route persistence failed request_id=%s error_type=%s",
-            outcome.request_id,
+            request_id,
             error_type,
-            extra={"request_id": outcome.request_id, "error_type": error_type},
+            extra={"request_id": request_id, "error_type": error_type},
         )
 
 

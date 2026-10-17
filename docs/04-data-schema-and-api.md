@@ -20,7 +20,7 @@ erDiagram
 | source | TEXT | CHECK in (`ui`,`api`,`eval`) |
 | client_ip_hash | CHAR(64) NULL | hashed, never raw IP |
 | dry_run | BOOLEAN | |
-| cache_hit | BOOLEAN | |
+| cache_hit | BOOLEAN | NOT NULL DEFAULT false; true for a response-cache hit (no `model_calls`, no cost, no reservation; migration `7b67e41902f4`) |
 | status | TEXT | `success` / `failed` |
 | final_model | TEXT NULL | |
 | response_text | TEXT NULL | |
@@ -146,7 +146,7 @@ or reserves strong budget, or calls a model. Only successful answers that did no
 chain and were not downgraded for budget (`BUDGET`) are cached, for `CACHE_TTL_SECONDS`. If the cache is
 not configured or Redis fails, the request routes normally with `cache_hit: false`. The cache is global:
 any client sending the same prompt within the TTL receives the same answer, so prompts must not contain
-personal or confidential data. Cache hits are not yet saved to `requests`.
+personal or confidential data. Each hit is saved as one `requests` row with `cache_hit = true` and no `model_calls`, and `GET /api/requests/{id}` reports `cache_hit`.
 
 Diagnostic fields (implemented in `app/routes/route.py`; present in `200` bodies and, under
 `decision` / `attempts`, in `502`/`503` failure bodies). They carry status codes and exception
