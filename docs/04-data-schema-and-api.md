@@ -93,7 +93,7 @@ Dataset `data/eval_prompts.jsonl`:
 ## Part B: Redis keys
 | Key | Type | TTL | Purpose |
 |---|---|---|---|
-| `cache:v1:{namespace}:{config_version}:{classifier_version}:{prompt_hmac}` | string (JSON) | 86,400 s (`CACHE_TTL_SECONDS`) | Cached decision + answer (S2.14; stored by `app.infra.cache.ResponseCache`, not used by `/api/route` yet). `namespace` = `CACHE_NAMESPACE`; `prompt_hmac` = HMAC-SHA256 under `CACHE_KEY_SECRET` of the prompt after Unicode NFC and trimming outer whitespace (case and inner whitespace kept); `classifier_version` = sha256 of the Jev model and default questions. See `app/infra/cache.py` |
+| `cache:v1:{namespace}:{config_version}:{classifier_version}:{prompt_hmac}` | string (JSON) | 86,400 s (`CACHE_TTL_SECONDS`) | Cached decision + answer (S2.14; `app.infra.cache.ResponseCache`, used by `/api/route` when `use_cache` is true). `namespace` = `CACHE_NAMESPACE`; `prompt_hmac` = HMAC-SHA256 under `CACHE_KEY_SECRET` of the prompt after Unicode NFC and trimming outer whitespace (case and inner whitespace kept); `classifier_version` = sha256 of the Jev model and default questions. See `app/infra/cache.py` |
 | `rl:{ip_hash}:{yyyymmddHHMM}` | integer (INCR) | 120 s | Per-IP rate limit |
 | `budget:strong:{yyyy-mm-dd}` | integer (INCR) | 2 days | Daily strong-model cap |
 
