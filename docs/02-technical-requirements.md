@@ -84,7 +84,7 @@ Map Score levels to 1–5. `difficulty` = expected value; `confidence` = min of 
 ## 5. Routing policy (initial values; tuned in Sprint 3)
 ```text
 if rate limit exceeded:                 HTTP 429 (no Jev call)
-if cache hit:                           return cached, reason = CACHE
+if use_cache and cache hit:             return cached, cache_hit = true (original reason kept; S2.14)
 if jev failed:                          STRONG general, reason = JEV_ERROR
 elif confidence < threshold:            STRONG general, reason = LOW_CONFIDENCE
 elif difficulty >= 3.5 or p_reasoning >= 0.6: STRONG [task], reason = HARD
@@ -127,6 +127,8 @@ DATABASE_URL=postgresql+psycopg://...   # Neon pooled URL in prod
 REDIS_URL=rediss://...                  # Upstash in prod
 CONFIDENCE_THRESHOLD=0.6
 CACHE_TTL_SECONDS=86400
+CACHE_NAMESPACE=                        # e.g. production; cache off unless set (S2.14)
+CACHE_KEY_SECRET=                       # HMAC key for cache keys, >= 32 chars; cache off unless set
 RATE_LIMIT_PER_MIN=10
 STRONG_DAILY_CAP=200
 REQUEST_BUDGET_SECONDS=50

@@ -1,0 +1,29 @@
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "plan": "Free",
+    "credits_remaining": 200,
+    "quota": {
+      "requests_per_minute": 10,
+      "requests_per_day": 50,
+      "used_last_minute": 0,
+      "used_today": 0
+    },
+    "limits": {
+      "max_state_chars": 24000,
+      "max_questions": 12,
+      "credit_cost": {
+        "standard": 1,
+        "large": 3
+      }
+    },
+    "models": [
+      {
+        "id": "jev",
+        "vendor": "TypeSafe",
+        "credit_multiplier": 1
+      }
+    ]
+  }
+}

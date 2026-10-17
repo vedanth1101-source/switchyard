@@ -75,7 +75,8 @@ Tests: `test_health_ok`, `test_health_reports_db_and_redis` (integration),
 `test_failed_request_persisted`, `test_metrics_tier_split_and_savings`,
 `test_metrics_p95_latency`, `test_fallback_rate`
 **2.3 Redis (fakeredis):**
-`test_cache_key_normalizes_whitespace_case`, `test_cache_key_includes_config_version`,
+`test_cache_key_normalizes_whitespace_case` (S2.14 decision U3: NFC and outer whitespace only, case kept;
+see tests/test_cache.py), `test_cache_key_includes_config_version`,
 `test_cache_roundtrip_with_ttl`, `test_rate_limit_allows_then_blocks`,
 `test_rate_limit_resets_next_minute`, `test_budget_counter_daily_key`
 **2.4 Router v2:** `test_cache_hit_skips_jev_and_model`, `test_budget_used_for_strong_only`

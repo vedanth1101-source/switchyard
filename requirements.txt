@@ -8,3 +8,4 @@ sqlalchemy==2.1.4
 psycopg[binary]==3.3.6
 redis==8.1.0
 pydantic-settings==2.15.0
+PyYAML==6.0.3

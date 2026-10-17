@@ -1,0 +1,43 @@
+{
+  "_comment": "SYNTHETIC: hand-written from the schema of jev_response_success.json to cover a low-confidence, hard prompt (Task 0.8). Not a real Jev response; usage, credits, model and latency_ms are deliberately omitted.",
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "answers": {
+      "task_type": {
+        "type": "choice",
+        "choice": "math",
+        "probabilities": {
+          "code": 0.10,
+          "math": 0.55,
+          "writing": 0.05,
+          "general": 0.30
+        },
+        "confidence": 0.55
+      },
+      "difficulty": {
+        "type": "score",
+        "score": 3.2,
+        "legend": {
+          "0": "trivial",
+          "1": "easy",
+          "2": "moderate",
+          "3": "hard",
+          "4": "expert"
+        },
+        "probabilities": {
+          "0": 0.0,
+          "1": 0.05,
+          "2": 0.15,
+          "3": 0.35,
+          "4": 0.45
+        },
+        "confidence": 0.45
+      },
+      "needs_reasoning": {
+        "type": "noul",
+        "noul": 0.82
+      }
+    }
+  }
+}

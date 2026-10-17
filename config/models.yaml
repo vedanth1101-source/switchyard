@@ -1,0 +1,74 @@
+# Switchyard model configuration (Task 0.9).
+#
+# Loaded and validated by app/core/model_config.py (Task S1.1), which builds RoutingConfig from it:
+#   RoutingConfig.models               <- routes
+#   RoutingConfig.general_strong_chain <- routes.general.strong   (derived; never set separately)
+# Routing thresholds stay in RoutingConfig/settings (TRD §8); the strong daily cap is the
+# STRONG_DAILY_CAP setting (project decision: 100; TRD §7 still says 200 and is not changed yet).
+#
+# Hard dollar-budget guarantee: UNRESOLVED. The strong cap limits requests, not dollars; cheap
+# requests are limited only per IP. A dollar counter is deferred (see the Task 0.9 PR description).
+
+schema_version: 1
+
+providers:
+  ai_gateway:
+    base_url: https://ai-gateway.vercel.sh/v1   # OpenAI-compatible endpoint
+    api_key_env: AI_GATEWAY_API_KEY             # variable NAME only; the value comes from the environment
+
+pricing:
+  currency: USD
+  unit: per_million_tokens
+  as_of: "2026-10-11"
+  source: https://ai-gateway.vercel.sh/v1/models   # public list prices; used for estimates only (FR-9)
+
+catalog:
+  openai/gpt-5-nano:
+    provider: ai_gateway
+    vendor: openai
+    free_tier_eligible: true      # confirmed by the project owner in the Vercel dashboard; not tool-verified
+    input_price: 0.05
+    output_price: 0.40
+    context_window: 400000        # from the source above
+    max_output_tokens: 1024       # PROVISIONAL: cost-bounding assumption; reasoning-token interaction unverified
+  google/gemini-2.5-flash-lite:
+    provider: ai_gateway
+    vendor: google
+    free_tier_eligible: true      # confirmed by the project owner; not tool-verified
+    input_price: 0.10
+    output_price: 0.40
+    context_window: 1048576
+    max_output_tokens: 1024       # PROVISIONAL
+  openai/gpt-5-mini:
+    provider: ai_gateway
+    vendor: openai
+    free_tier_eligible: true      # confirmed by the project owner; not tool-verified
+    input_price: 0.25
+    output_price: 2.00
+    context_window: 400000
+    max_output_tokens: 1024       # PROVISIONAL
+  google/gemini-2.5-flash:
+    provider: ai_gateway
+    vendor: google
+    free_tier_eligible: true      # confirmed by the project owner; not tool-verified
+    input_price: 0.30
+    output_price: 2.50
+    context_window: 1000000
+    max_output_tokens: 1024       # PROVISIONAL
+
+# Ordered fallback chains (first model tried first). Each chain spans two vendors.
+# Tasks without their own entry fall back to `general` (RoutingConfig.get_chain behaviour).
+# Executor behaviour (Task 1.7, not implemented): if a strong chain is exhausted, the request falls
+# back to the cheap chain for the same task; if that is also exhausted, the API returns 502.
+# Attempt bound: 2 models per chain x 3 attempts per model = up to 6 strong attempts, then up to
+# 6 cheap attempts, all within the 50 s request deadline (which may end the sequence earlier).
+routes:
+  general:
+    cheap:  [openai/gpt-5-nano, google/gemini-2.5-flash-lite]
+    strong: [openai/gpt-5-mini, google/gemini-2.5-flash]
+
+baseline_model: openai/gpt-5-mini   # FR-9 always-strong baseline
+
+limits:
+  max_chain_length: 2               # project choice; validated by the Task 1.1 loader
+  max_attempts_per_model: 3         # 1 try + up to 2 retries (TRD §6)

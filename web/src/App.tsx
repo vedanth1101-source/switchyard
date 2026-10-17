@@ -6,6 +6,11 @@ type HealthState = { kind: "loading" } | { kind: "report"; report: HealthReport 
 
 const COMPONENT_STATUSES: readonly unknown[] = ["ok", "error", "not_configured"];
 
+// S2.14 decision U1: the response cache is shared by every client, so a cached answer can be returned to
+// anyone who sends the same prompt. Shown on every page state, before any prompt can be entered.
+const PERSONAL_DATA_NOTICE =
+  "Do not enter personal or confidential information. Answers can be cached and returned to anyone who sends the same prompt.";
+
 function isHealthReport(body: unknown): body is HealthReport {
   if (typeof body !== "object" || body === null) return false;
   const { status, db, redis } = body as Record<string, unknown>;
@@ -61,6 +66,7 @@ export default function App() {
   return (
     <main>
       <h1>Switchyard</h1>
+      <p role="note">{PERSONAL_DATA_NOTICE}</p>
       <p role="status">{statusText}</p>
     </main>
   );

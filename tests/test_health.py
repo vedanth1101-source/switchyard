@@ -1,4 +1,4 @@
-"""GET /api/health contract (Task 0.5): API, PostgreSQL and Redis status."""
+"""GET /api/health contract (Task 0.5; S2.8): API, PostgreSQL and Redis status, and the model config version."""
 
 import asyncio
 import logging
@@ -6,6 +6,7 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.model_config import load_model_config
 from app.core.settings import Settings, get_settings
 from app.main import app, create_app
 from app.routes import health
@@ -32,7 +33,12 @@ def test_health_ok():
     response = client_with_statuses("ok", "ok").get("/api/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok", "redis": "ok"}
+    assert response.json() == {
+        "status": "ok",
+        "config_version": loader_version(get_settings()),
+        "db": "ok",
+        "redis": "ok",
+    }
 
 
 @pytest.mark.parametrize(
@@ -49,18 +55,120 @@ def test_degraded_dependency_returns_503_with_both_statuses(db, redis, expected)
     response = client_with_statuses(db, redis).get("/api/health")
 
     assert response.status_code == 503
-    assert response.json() == expected
+    assert response.json() == {**expected, "config_version": loader_version(get_settings())}
 
 
-def test_health_has_no_config_version_until_task_1_1():
-    assert "config_version" not in client_with_statuses("ok", "ok").get("/api/health").json()
+def loader_version(settings: Settings) -> str:
+    """The version the existing loader gives for these settings (the health endpoint must match it)."""
+    return load_model_config(
+        settings.models_config_path, confidence_threshold=settings.confidence_threshold
+    ).config_version
+
+
+def test_health_reports_the_loader_config_version():
+    response = client_with_statuses("ok", "ok").get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["config_version"] == loader_version(get_settings())
+
+
+@pytest.mark.parametrize("threshold", ["0.6", "0.75"])
+def test_config_version_follows_confidence_threshold(monkeypatch, threshold):
+    monkeypatch.setenv("CONFIDENCE_THRESHOLD", threshold)
+    get_settings.cache_clear()
+
+    version = client_with_statuses("ok", "ok").get("/api/health").json()["config_version"]
+
+    assert version == loader_version(get_settings())
+
+
+def test_different_thresholds_give_different_health_versions(monkeypatch):
+    versions = []
+    for threshold in ("0.6", "0.75"):
+        monkeypatch.setenv("CONFIDENCE_THRESHOLD", threshold)
+        get_settings.cache_clear()
+        versions.append(client_with_statuses("ok", "ok").get("/api/health").json()["config_version"])
+
+    assert versions[0] != versions[1]
+
+
+CONFIG_CANARY = "CANARY-S28-model-config-path"
+
+
+def unreadable_config(tmp_path):
+    return tmp_path / CONFIG_CANARY / "missing-models.yaml"
+
+
+def invalid_yaml_config(tmp_path):
+    path = tmp_path / CONFIG_CANARY / "models.yaml"
+    path.parent.mkdir()
+    path.write_text(f"schema_version: [unclosed {CONFIG_CANARY}\n", encoding="utf-8")
+    return path
+
+
+def invalid_schema_config(tmp_path):
+    path = tmp_path / CONFIG_CANARY / "models.yaml"
+    path.parent.mkdir()
+    path.write_text(f"schema_version: 1\nproviders: {{{CONFIG_CANARY}: 1}}\n", encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("make_config", [unreadable_config, invalid_yaml_config, invalid_schema_config])
+@pytest.mark.parametrize(("db", "redis"), [("ok", "ok"), ("error", "not_configured")])
+def test_invalid_model_config_is_degraded_503_without_leaking_it(monkeypatch, tmp_path, caplog, make_config, db, redis):
+    monkeypatch.setenv("MODELS_CONFIG_PATH", str(make_config(tmp_path)))
+    get_settings.cache_clear()
+
+    with caplog.at_level(logging.DEBUG, logger="app.routes.health"):
+        response = client_with_statuses(db, redis).get("/api/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "degraded", "config_version": None, "db": db, "redis": redis}
+    assert [(r.levelno, r.component, r.error_type) for r in caplog.records] == [
+        (logging.WARNING, "config", "ModelConfigError")
+    ]
+    assert caplog.records[0].getMessage() == "health check failed component=config error_type=ModelConfigError"
+    for leaked in (CONFIG_CANARY, str(tmp_path), "models.yaml", "invalid YAML", "cannot read"):
+        assert leaked not in response.text
+        assert leaked not in caplog.text
+
+
+def test_unexpected_config_loader_errors_are_not_swallowed(monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("config loader bug")
+
+    monkeypatch.setattr(health, "load_model_config", broken)
+
+    with pytest.raises(RuntimeError, match="config loader bug"):
+        health.config_version_status(get_settings())
+
+
+def test_unexpected_config_loader_errors_reach_the_generic_500(monkeypatch, caplog):
+    def broken(*args, **kwargs):
+        raise RuntimeError("config loader bug CANARY-S28-runtime")
+
+    monkeypatch.setattr(health, "load_model_config", broken)
+
+    with caplog.at_level(logging.DEBUG):
+        response = client_with_statuses("ok", "ok").get("/api/health")
+
+    assert response.status_code == 500
+    assert response.json() == {"request_id": response.headers["X-Request-ID"], "error": "internal_error"}
+    assert "health check failed" not in caplog.text  # Not reported as a configuration failure
+    assert "CANARY-S28-runtime" not in response.text
+    assert "CANARY-S28-runtime" not in caplog.text
 
 
 def test_missing_urls_are_not_configured_without_crashing():
     response = client_with_urls(None, None).get("/api/health")
 
     assert response.status_code == 503
-    assert response.json() == {"status": "degraded", "db": "not_configured", "redis": "not_configured"}
+    assert response.json() == {
+        "status": "degraded",
+        "config_version": loader_version(get_settings()),
+        "db": "not_configured",
+        "redis": "not_configured",
+    }
 
 
 def test_blank_env_values_count_as_not_configured(monkeypatch):
@@ -93,7 +201,12 @@ def test_real_check_paths_report_ok(monkeypatch):
     response = client_with_urls("postgresql+psycopg://example/db", "rediss://example:6379").get("/api/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok", "redis": "ok"}
+    assert response.json() == {
+        "status": "ok",
+        "config_version": loader_version(get_settings()),
+        "db": "ok",
+        "redis": "ok",
+    }
 
 
 def test_database_failure_still_checks_redis(monkeypatch, tmp_path):
@@ -114,7 +227,12 @@ def test_database_failure_still_checks_redis(monkeypatch, tmp_path):
     response = client_with_urls("postgresql+psycopg://example/db", "rediss://example:6379").get("/api/health")
 
     assert response.status_code == 503
-    assert response.json() == {"status": "degraded", "db": "error", "redis": "ok"}
+    assert response.json() == {
+        "status": "degraded",
+        "config_version": loader_version(get_settings()),
+        "db": "error",
+        "redis": "ok",
+    }
     assert len(redis_calls) == 1
 
 

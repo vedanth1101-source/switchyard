@@ -1,0 +1,52 @@
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "model": "jev-1.13.0",
+    "answers": {
+      "task_type": {
+        "type": "choice",
+        "choice": "code",
+        "probabilities": {
+          "code": 1.0,
+          "math": 0.0,
+          "writing": 0.0,
+          "general": 0.0
+        },
+        "confidence": 1.0
+      },
+      "difficulty": {
+        "type": "score",
+        "score": 0.01,
+        "legend": {
+          "0": "trivial",
+          "1": "easy",
+          "2": "moderate",
+          "3": "hard",
+          "4": "expert"
+        },
+        "probabilities": {
+          "0": 0.99,
+          "1": 0.01,
+          "2": 0.0,
+          "3": 0.0,
+          "4": 0.0
+        },
+        "confidence": 0.99
+      },
+      "needs_reasoning": {
+        "type": "noul",
+        "noul": 0.19
+      }
+    },
+    "usage": {
+      "input_tokens": 446,
+      "output_tokens": 79
+    },
+    "credits": {
+      "charged": 1,
+      "remaining": 199
+    },
+    "latency_ms": 1434
+  }
+}
