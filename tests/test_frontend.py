@@ -4,12 +4,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main
+from app.core.model_config import load_model_config
+from app.core.settings import Settings
 from app.main import create_app
 from app.routes import health
 
 HTML = {"accept": "text/html"}
 SPA_MARKER = '<div id="root">switchyard-test-shell</div>'
-HEALTHY = {"status": "ok", "db": "ok", "redis": "ok"}
+_SETTINGS = Settings()  # The values the app reads too (MODELS_CONFIG_PATH, CONFIDENCE_THRESHOLD)
+_VERSION = load_model_config(_SETTINGS.models_config_path, confidence_threshold=_SETTINGS.confidence_threshold)
+HEALTHY = {"status": "ok", "config_version": _VERSION.config_version, "db": "ok", "redis": "ok"}
 
 
 def with_healthy_services(test_app):
@@ -136,3 +140,58 @@ def test_missing_frontend_build_is_tolerated_with_warning_in_development(monkeyp
         dev_app = create_app(frontend_dir=tmp_path / "not-built")
 
     assert TestClient(with_healthy_services(dev_app)).get("/api/health").json() == HEALTHY
+
+
+# --- S2.12: GET on a registered non-GET API route is 405, not the catch-all's 404 ----------------
+
+
+def test_get_on_the_route_endpoint_is_405_allowing_post(client):
+    response = client.get("/api/route")
+
+    assert response.status_code == 405
+    assert response.headers["allow"] == "POST"
+    assert response.json() == {"detail": "Method Not Allowed"}
+    assert "x-request-id" in response.headers
+
+
+def test_get_on_every_documented_non_get_api_route_is_405_with_its_methods(client):
+    paths = client.get("/api/openapi.json").json()["paths"]
+    non_get = {path: {method.upper() for method in ops} for path, ops in paths.items() if "get" not in ops}
+
+    assert "/api/route" in non_get  # The table is not empty
+    for path, methods in non_get.items():
+        response = client.get(path)
+        assert response.status_code == 405, path
+        assert set(response.headers["allow"].split(", ")) == methods, path
+        assert response.json() == {"detail": "Method Not Allowed"}, path
+
+
+@pytest.mark.parametrize("path", ["/api/nope", "/api", "/api/route/", "/api/Route", "/api?path=route"])
+def test_get_on_unregistered_api_paths_stays_json_404(client, path):
+    response = client.get(path)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+    assert "allow" not in response.headers
+    assert "x-request-id" in response.headers
+
+
+@pytest.mark.parametrize("method", ["POST", "HEAD"])
+def test_wrong_method_on_health_still_405_allowing_get(client, method):
+    response = client.request(method, "/api/health")
+
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET"
+    assert "x-request-id" in response.headers
+
+
+def test_health_get_and_route_post_still_reach_their_handlers(client):
+    assert client.get("/api/health").status_code == 200
+    assert client.post("/api/route", json={}).status_code == 422  # Validation, before any routing work
+
+
+def test_openapi_lists_only_post_for_the_route_endpoint(client):
+    paths = client.get("/api/openapi.json").json()["paths"]
+
+    assert set(paths["/api/route"]) == {"post"}
+    assert not {path for path in paths if path == "/api" or "{path" in path}

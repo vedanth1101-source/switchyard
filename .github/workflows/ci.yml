@@ -99,12 +99,59 @@ jobs:
           FASTAPI_ENV: production
         run: >-
           pytest -m integration -rA --junitxml="$RUNNER_TEMP/integration.xml"
-          tests/test_health_integration.py tests/test_migrations_integration.py
+          tests/test_health_integration.py tests/test_migrations_integration.py tests/test_budget_integration.py
+          tests/test_db_schema_integration.py tests/test_repo_integration.py tests/test_route_persistence_integration.py
+          tests/test_ratelimit_integration.py tests/test_requests_integration.py tests/test_cache_integration.py
       - name: Require the integration tests to have run and passed (not skipped)
         run: |
           python - <<'EOF'
           import os, sys, xml.etree.ElementTree as ET
-          REQUIRED = {"test_health_reports_db_and_redis", "test_migrations_upgrade_downgrade_round_trip"}
+          REQUIRED = {
+              "test_health_reports_db_and_redis",
+              "test_migrations_upgrade_downgrade_round_trip",
+              "test_cap_allows_exactly_three_of_five_and_counts_denied_reservations",
+              "test_concurrent_reservations_across_independent_clients_never_exceed_the_cap",
+              "test_concurrent_reservations_at_cap_minus_one_allow_exactly_one",
+              "test_reservation_sets_the_two_day_ttl",
+              "test_reservation_adds_a_ttl_to_an_existing_key_without_one",
+              "test_expired_counter_resets_the_budget",
+              "test_utc_midnight_starts_a_new_key_and_leaves_the_previous_day_unchanged",
+              "test_closed_local_port_fails_closed_without_logging_the_url",
+              "test_corrupt_counter_fails_closed_in_available_and_reserve",
+              "test_upgraded_schema_matches_the_models",
+              "test_success_dry_run_and_failed_outcomes_insert_and_round_trip",
+              "test_deleting_a_request_deletes_its_model_calls",
+              "test_invalid_rows_are_rejected_by_constraints",
+              "test_duplicate_request_and_attempt_keys_are_rejected",
+              "test_save_outcome_persists_the_request_and_its_attempts_in_order",
+              "test_every_outcome_shape_route_returns_is_accepted",
+              "test_jev_failure_maps_absent_jev_data_to_sql_null",
+              "test_a_rejected_attempt_rolls_back_the_whole_outcome",
+              "test_saving_the_same_outcome_twice_fails_and_keeps_exactly_one_copy",
+              "test_routed_request_is_saved_under_its_response_request_id",
+              "test_failed_route_is_saved_with_its_attempts_in_order",
+              "test_unreachable_database_still_returns_the_routing_response",
+              "test_concurrent_checks_across_independent_clients_admit_exactly_the_limit",
+              "test_distinct_identities_stay_isolated_under_concurrency",
+              "test_next_window_starts_a_new_counter_with_its_own_ttl",
+              "test_corrupt_counter_fails_open_and_still_gets_a_ttl",
+              "test_closed_local_port_fails_open_with_one_sanitized_warning",
+              "test_route_returns_429_after_ten_requests_without_building_dependencies",
+              "test_load_request_reads_back_a_success_with_its_calls_in_order",
+              "test_load_request_reads_a_dry_run_without_calls",
+              "test_load_request_keeps_a_failed_requests_priced_attempt",
+              "test_load_request_orders_calls_by_seq_not_insertion_order",
+              "test_load_request_returns_none_for_an_unknown_id",
+              "test_get_after_post_returns_the_saved_request_end_to_end",
+              "test_rows_inserted_without_cache_hit_default_to_false",
+              "test_cache_hit_rows_save_and_read_back_exactly",
+              "test_cache_hit_is_saved_under_its_response_request_id",
+              "test_store_then_lookup_round_trips_on_real_redis_with_the_configured_ttl",
+              "test_expired_entry_is_a_miss_on_real_redis",
+              "test_concurrent_identical_stores_across_independent_clients_leave_one_entry",
+              "test_closed_local_port_fails_open_quickly_with_sanitized_warnings",
+              "test_route_serves_a_hit_from_real_redis_without_jev_budget_or_model",
+          }
           root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "integration.xml")).getroot()
           cases = list(root.iter("testcase"))
           bad = [c.get("name") for c in cases if c.find("skipped") is not None

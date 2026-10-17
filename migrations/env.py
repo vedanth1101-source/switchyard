@@ -12,6 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
 
+import app.db.models  # noqa: F401  Registers the request tables on SQLModel.metadata
 from app.core.settings import get_settings
 
 config = context.config
@@ -20,7 +21,7 @@ config = context.config
 if config.config_file_name is not None and config.attributes.get("configure_logger", True):
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-# Empty until Sprint 2.1 adds models; autogenerate compares against this.
+# The request tables (app/db/models.py, Task S2.3); autogenerate compares against this.
 target_metadata = SQLModel.metadata
 
 

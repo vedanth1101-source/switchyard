@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
+from app.core.model_config import load_model_config
 from app.core.settings import get_settings
 from app.main import create_app
 
@@ -28,6 +29,9 @@ def require_real_service_urls(environ: Mapping[str, str]) -> tuple[str, str]:
     SQLite or any other database must not satisfy the PostgreSQL requirement. Failure messages
     name the variable, never its value.
     """
+    # Hide this frame from tracebacks: pytest would otherwise print the `environ` argument, including
+    # both URLs' passwords and every other variable.
+    __tracebackhide__ = True
     database_url = environ.get("DATABASE_URL", "").strip()
     redis_url = environ.get("REDIS_URL", "").strip()
     if not database_url:
@@ -51,5 +55,7 @@ def test_health_reports_db_and_redis():
 
     response = TestClient(create_app()).get("/api/health")
 
+    settings = get_settings()
+    version = load_model_config(settings.models_config_path, confidence_threshold=settings.confidence_threshold)
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok", "redis": "ok"}
+    assert response.json() == {"status": "ok", "config_version": version.config_version, "db": "ok", "redis": "ok"}

@@ -25,6 +25,9 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 def require_local_postgres_url(environ: Mapping[str, str]) -> str:
     """Fail unless DATABASE_URL is PostgreSQL on a local host. Messages never include the URL."""
+    # Hide this frame from tracebacks: pytest would otherwise print the `environ` argument, including
+    # DATABASE_URL's password and every other variable.
+    __tracebackhide__ = True
     database_url = environ.get("DATABASE_URL", "").strip()
     if not database_url:
         pytest.fail("Migration test needs a local PostgreSQL service; set DATABASE_URL")
