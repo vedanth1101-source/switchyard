@@ -14,7 +14,27 @@ function respondWith(status: number, body: unknown) {
   return fetchMock;
 }
 
+const PERSONAL_DATA_NOTICE =
+  "Do not enter personal or confidential information. Answers can be cached and returned to anyone who sends the same prompt.";
+
 describe("App", () => {
+  it("shows the personal-data notice before the health check finishes", () => {
+    respondWith(200, { status: "ok", db: "ok", redis: "ok" });
+
+    render(<App />);
+
+    expect(screen.getByRole("note").textContent).toBe(PERSONAL_DATA_NOTICE);
+  });
+
+  it("keeps the personal-data notice when the API is unreachable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+
+    render(<App />);
+
+    expect(await screen.findByText("API unreachable: Failed to fetch")).toBeTruthy();
+    expect(screen.getByRole("note").textContent).toBe(PERSONAL_DATA_NOTICE);
+  });
+
   it("renders health status", async () => {
     const fetchMock = respondWith(200, { status: "ok", db: "ok", redis: "ok" });
 
