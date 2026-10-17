@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # CLIENT_IP_HEADER: trusted header holding the client IP (x-real-ip on Vercel); unset = socket peer.
     client_ip_header: str | None = None
     rate_limit_ip_salt: SecretStr | None = None  # RATE_LIMIT_IP_SALT: HMAC key for rate-limit identities
+    # S2.14 response cache (app.infra.cache): off unless REDIS_URL, CACHE_NAMESPACE and CACHE_KEY_SECRET are all set.
+    # CACHE_NAMESPACE: the deployment environment in every cache key (e.g. production); ":" is not allowed.
+    cache_namespace: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    cache_key_secret: SecretStr | None = Field(default=None, min_length=32)  # CACHE_KEY_SECRET: HMAC key for keys
+    cache_ttl_seconds: int = Field(default=86400, ge=1)  # CACHE_TTL_SECONDS
 
     @field_validator(
         "database_url",
@@ -51,6 +56,8 @@ class Settings(BaseSettings):
         "jevstation_api_key",
         "client_ip_header",
         "rate_limit_ip_salt",
+        "cache_namespace",
+        "cache_key_secret",
         mode="before",
     )
     @classmethod
@@ -58,6 +65,12 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("cache_namespace", mode="before")
+    @classmethod
+    def strip_cache_namespace(cls, value: object) -> object:
+        # Before the pattern check, so a padded name ("preview\n") is accepted as "preview".
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("client_ip_header")
     @classmethod

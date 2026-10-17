@@ -78,6 +78,7 @@ class JevClient:
     DEFAULT_BASE_URL = "https://jevstation.com/api/v1/systemone"
     DEFAULT_TIMEOUT_SECONDS = 8.0  # Settings.jev_timeout_seconds (JEV_TIMEOUT_SECONDS) defaults to this
     MAX_STATE_CHARS = 24000
+    DEFAULT_MODEL = "jev"  # evaluate()'s default; part of app.infra.cache.classifier_version()
 
     def __init__(
         self,
@@ -130,7 +131,7 @@ class JevClient:
         self,
         state: str,
         questions: Dict[str, Any],
-        model: str = "jev",
+        model: str = DEFAULT_MODEL,
         question_set_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
