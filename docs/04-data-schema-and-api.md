@@ -136,6 +136,18 @@ Response `200`
 Errors: `422` empty or > 8,000-character prompt · `429` rate limited (`Retry-After`
 header) · `502` all models failed or deadline hit (body has `attempts`).
 
+Response cache (S2.14; implemented in `app/routes/route.py` and `app/infra/cache.py`): `use_cache`
+defaults to `false` and is ignored for dry runs. Every `200` has `cache_hit`. A hit (checked after the rate
+limit, so hits count toward it) returns the cached `decision` and `response` with `cache_hit: true`,
+`response.attempts: []`, `response.fell_back_to_cheap: false`, `strong_reserved: false` and `cost: null`
+(no model call was made); the decision keeps its original `reason` (no `CACHE` reason) and its Jev
+latency and error fields are null, because this request made no Jev call. A hit never calls Jev, checks
+or reserves strong budget, or calls a model. Only successful answers that did not fall back to the cheap
+chain and were not downgraded for budget (`BUDGET`) are cached, for `CACHE_TTL_SECONDS`. If the cache is
+not configured or Redis fails, the request routes normally with `cache_hit: false`. The cache is global:
+any client sending the same prompt within the TTL receives the same answer, so prompts must not contain
+personal or confidential data. Cache hits are not yet saved to `requests`.
+
 Diagnostic fields (implemented in `app/routes/route.py`; present in `200` bodies and, under
 `decision` / `attempts`, in `502`/`503` failure bodies). They carry status codes and exception
 class names only, never exception messages, response bodies, URLs, prompts or keys.

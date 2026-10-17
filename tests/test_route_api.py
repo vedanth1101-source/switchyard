@@ -155,7 +155,9 @@ def test_route_200_schema():
         "total_latency_ms",
         "config_version",
         "cost",  # S1.8: added deliberately (docs/04 response contract)
+        "cache_hit",  # S2.14: added deliberately (docs/04 response contract; false unless served from the cache)
     }
+    assert body["cache_hit"] is False
     assert body["dry_run"] is False
     assert body["strong_reserved"] is False
     assert body["config_version"] == CONFIG.config_version
