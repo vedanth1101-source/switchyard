@@ -101,7 +101,7 @@ jobs:
           pytest -m integration -rA --junitxml="$RUNNER_TEMP/integration.xml"
           tests/test_health_integration.py tests/test_migrations_integration.py tests/test_budget_integration.py
           tests/test_db_schema_integration.py tests/test_repo_integration.py tests/test_route_persistence_integration.py
-          tests/test_ratelimit_integration.py tests/test_requests_integration.py
+          tests/test_ratelimit_integration.py tests/test_requests_integration.py tests/test_cache_integration.py
       - name: Require the integration tests to have run and passed (not skipped)
         run: |
           python - <<'EOF'
@@ -146,6 +146,11 @@ jobs:
               "test_rows_inserted_without_cache_hit_default_to_false",
               "test_cache_hit_rows_save_and_read_back_exactly",
               "test_cache_hit_is_saved_under_its_response_request_id",
+              "test_store_then_lookup_round_trips_on_real_redis_with_the_configured_ttl",
+              "test_expired_entry_is_a_miss_on_real_redis",
+              "test_concurrent_identical_stores_across_independent_clients_leave_one_entry",
+              "test_closed_local_port_fails_open_quickly_with_sanitized_warnings",
+              "test_route_serves_a_hit_from_real_redis_without_jev_budget_or_model",
           }
           root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "integration.xml")).getroot()
           cases = list(root.iter("testcase"))

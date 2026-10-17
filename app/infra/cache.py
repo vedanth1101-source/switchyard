@@ -1,7 +1,7 @@
 """
-Response cache: configuration, keys and Redis reads/writes (Task S2.14, steps 1-2; docs/04 Part B).
+Response cache: configuration, keys and Redis reads/writes (Task S2.14; docs/04 Part B).
 
-/api/route does not use the cache yet: `use_cache` is still accepted and ignored.
+/api/route uses it for requests with `use_cache: true` (app.routes.route).
 
 Key: `cache:v{CACHE_FORMAT_VERSION}:{namespace}:{config_version}:{classifier_version}:{prompt_hmac}`.
 - namespace: CACHE_NAMESPACE, the deployment environment, so Preview and Production never share entries
