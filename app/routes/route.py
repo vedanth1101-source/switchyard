@@ -29,12 +29,21 @@ header and a RouteErrorResponse (error=rate_limited); it never builds clients, c
 strong budget or is persisted. See app.infra.ratelimit for the window, the client identity and why a
 missing Redis or salt fails open.
 
-Not implemented yet: cache (`use_cache` is accepted and ignored; `cache_hit` is omitted).
+Response cache (S2.14; app.infra.cache): opt-in with `use_cache: true` and never used for dry runs. After
+the rate limit and before any dependency is built, the cached answer for the prompt is looked up under the
+current model configuration version. A hit returns 200 with `cache_hit: true`, the cached decision and
+answer, `attempts: []`, `strong_reserved: false` and `cost: null` (no model call was made); it never calls
+Jev, checks or reserves strong budget, or calls a model, and the decision's Jev latency and error fields
+are null. On a miss the request routes as usual, its outcome is persisted, and then a cacheable answer is
+written. The cache fails open: when it is not configured (one INFO line) or Redis fails, the request
+routes as if `use_cache` were false. Cache hits are not persisted yet. Every other 200 has
+`cache_hit: false`.
 """
 
 import dataclasses
 import functools
 import logging
+import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -47,11 +56,12 @@ from app.core.costs import CostEstimate
 from app.core.executor import Attempt
 from app.core.jev_client import JevAuthError
 from app.core.llm_client import LLMAuthError
-from app.core.model_config import ModelConfigError
+from app.core.model_config import ModelConfigError, load_model_config
 from app.core.policy import RoutingConfigError
 from app.core.router import CliConfigurationError, DepsFactory, RouteOutcome, build_cli_deps, route
 from app.core.settings import Settings, get_settings
 from app.db.repo import OutcomeRowsError, outcome_to_rows, save_outcome
+from app.infra.cache import CachedAnswer, ResponseCache, create_response_cache
 from app.infra.db import get_engine
 from app.infra.ratelimit import RateLimiter, create_rate_limiter, resolve_client_ip
 
@@ -76,6 +86,7 @@ ErrorCode = Literal[
 class RouteRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
     dry_run: bool = False
+    use_cache: bool = False  # Opt in to the response cache (ignored for dry runs)
 
     @field_validator("prompt")
     @classmethod
@@ -140,7 +151,8 @@ class RouteResponse(BaseModel):
     strong_reserved: bool
     total_latency_ms: int
     config_version: str
-    cost: Optional[CostOut]  # None for dry runs or when the cost cannot be calculated
+    cost: Optional[CostOut]  # None for dry runs, cache hits (no model call), or when it cannot be calculated
+    cache_hit: bool  # True when the answer came from the response cache
 
 
 class ValidationErrorItem(BaseModel):
@@ -185,6 +197,14 @@ async def get_rate_limiter(settings: Settings = Depends(get_settings)) -> AsyncI
         yield limiter
     finally:
         await limiter.aclose()
+
+
+CacheFactory = Callable[[Settings], Optional[ResponseCache]]
+
+
+def get_cache_factory() -> CacheFactory:
+    """Builds the response cache (None when it is not configured); called only for use_cache requests."""
+    return create_response_cache
 
 
 OutcomeRecorder = Callable[[RouteOutcome, str], Awaitable[None]]
@@ -233,28 +253,129 @@ async def route_prompt(
     deps_factory: DepsFactory = Depends(get_deps_factory),
     recorder: OutcomeRecorder = Depends(get_outcome_recorder),
     limiter: RateLimiter = Depends(get_rate_limiter),
+    cache_factory: CacheFactory = Depends(get_cache_factory),
 ) -> Any:
     peer = request.client.host if request.client is not None else None
     limit = await limiter.check(resolve_client_ip(request.headers, peer, settings.client_ip_header))
     request_id: str = request.state.request_id
     if limit.retry_after_seconds is not None:  # Refused; RateLimitDecision guarantees a wait of >= 1 s
         return _rate_limited(request_id, limit.retry_after_seconds)
+    started = time.monotonic()
+    cache = _open_cache(cache_factory, settings, body, request_id)
     try:
-        async with deps_factory(settings, dry_run=body.dry_run) as deps:
-            deps = dataclasses.replace(deps, new_request_id=lambda: request_id)
-            outcome = await route(body.prompt, dry_run=body.dry_run, deps=deps)
-    except LLMAuthError as exc:
-        return _setup_error(503, "model_gateway_not_configured", exc, request_id)
-    except JevAuthError as exc:
-        return _setup_error(503, "classifier_not_configured", exc, request_id)
-    except (ModelConfigError, CliConfigurationError, RoutingConfigError) as exc:
-        return _setup_error(500, "configuration_error", exc, request_id)
+        try:
+            if cache is not None:
+                hit = await _lookup(cache, body.prompt, settings, request_id, started)
+                if hit is not None:
+                    response.headers[REQUEST_ID_HEADER] = request_id
+                    return hit
+            async with deps_factory(settings, dry_run=body.dry_run) as deps:
+                deps = dataclasses.replace(deps, new_request_id=lambda: request_id)
+                outcome = await route(body.prompt, dry_run=body.dry_run, deps=deps)
+        except LLMAuthError as exc:
+            return _setup_error(503, "model_gateway_not_configured", exc, request_id)
+        except JevAuthError as exc:
+            return _setup_error(503, "classifier_not_configured", exc, request_id)
+        except (ModelConfigError, CliConfigurationError, RoutingConfigError) as exc:
+            return _setup_error(500, "configuration_error", exc, request_id)
 
-    await _persist(recorder, outcome, body.prompt)  # The same prompt string route() received
-    if outcome.status == "failed":
-        return _failure(outcome)
-    response.headers[REQUEST_ID_HEADER] = outcome.request_id
-    return _success(outcome)
+        await _persist(recorder, outcome, body.prompt)  # The same prompt string route() received
+        if cache is not None:
+            await cache.store(body.prompt, outcome)  # Writes only cacheable answers; fails open
+        if outcome.status == "failed":
+            return _failure(outcome)
+        response.headers[REQUEST_ID_HEADER] = outcome.request_id
+        return _success(outcome)
+    finally:
+        if cache is not None:
+            await cache.aclose()
+
+
+def _open_cache(
+    cache_factory: CacheFactory, settings: Settings, body: RouteRequest, request_id: str
+) -> Optional[ResponseCache]:
+    if not body.use_cache or body.dry_run:
+        return None
+    cache = cache_factory(settings)
+    if cache is None:
+        reason = "cache_not_configured"
+        logger.info(
+            "route cache skipped request_id=%s reason=%s",
+            request_id,
+            reason,
+            extra={"request_id": request_id, "reason": reason},
+        )
+    return cache
+
+
+async def _lookup(
+    cache: ResponseCache, prompt: str, settings: Settings, request_id: str, started: float
+) -> Optional[RouteResponse]:
+    # The version route() would use on a miss: build_cli_deps loads the same file with the same threshold.
+    # A ModelConfigError propagates to the handler's configuration_error response.
+    config_version = load_model_config(
+        settings.models_config_path, confidence_threshold=settings.confidence_threshold
+    ).config_version
+    answer = await cache.lookup(prompt, config_version=config_version)
+    if answer is None:
+        return None
+    hit = _cache_hit(request_id, answer, config_version, _elapsed_ms(started))
+    logger.info(
+        "route request_id=%s status=cache_hit tier=%s reason=%s final_model=%s",
+        request_id,
+        hit.decision.tier,
+        hit.decision.reason,
+        answer.response.model,
+        extra={
+            "request_id": request_id,
+            "status": "cache_hit",
+            "tier": hit.decision.tier,
+            "reason": hit.decision.reason,
+            "final_model": answer.response.model,
+        },
+    )
+    return hit
+
+
+def _cache_hit(request_id: str, answer: CachedAnswer, config_version: str, elapsed_ms: int) -> RouteResponse:
+    cached = answer.decision
+    decision = DecisionOut(
+        task_type=cached.task_type,
+        tier=cached.tier,
+        reason=cached.reason,  # The original reason; cache_hit marks the hit (decision U4)
+        model_chain=list(cached.model_chain),
+        task_type_probs=cached.task_type_probs,
+        difficulty=cached.difficulty,
+        needs_reasoning_prob=cached.needs_reasoning_prob,
+        confidence=cached.confidence,
+        jev_latency_ms=None,  # No Jev call in this request
+        jev_error=None,
+        jev_http_status=None,
+        jev_error_cause=None,
+    )
+    model_response = ModelResponseOut(
+        model=answer.response.model,
+        tier=answer.response.tier,
+        text=answer.response.text,
+        latency_ms=elapsed_ms,
+        fell_back_to_cheap=False,  # Fallback answers are never cached
+        attempts=[],
+    )
+    return RouteResponse(
+        request_id=request_id,
+        dry_run=False,
+        decision=decision,
+        response=model_response,
+        strong_reserved=False,
+        total_latency_ms=elapsed_ms,
+        config_version=config_version,
+        cost=None,  # No model call was made (decision U5)
+        cache_hit=True,
+    )
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
 
 
 async def _persist(recorder: OutcomeRecorder, outcome: RouteOutcome, prompt: str) -> None:
@@ -293,6 +414,7 @@ def _success(outcome: RouteOutcome) -> RouteResponse:
         total_latency_ms=outcome.total_latency_ms,
         config_version=outcome.config_version,
         cost=_cost_out(outcome.cost),
+        cache_hit=False,
     )
 
 
